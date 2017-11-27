@@ -1,0 +1,22 @@
+sensors = terrasse_temp	terrasse_hygro veranda_temp boite_temp
+devices = chauffage_veranda chauffage_boite
+
+sensor_terrasse_temp_id = 4
+sensor_terrasse_temp_cmd = sudo /usr/bin/read-temp /dev/hidraw3 | cut -d ' ' -f 3 | grep -o '[0-9.]*'
+
+sensor_terrasse_hygro_id = 7
+sensor_terrasse_hygro_cmd = sudo /usr/bin/read-temp /dev/hidraw3 | cut -d ' ' -f 4 | grep -o '[0-9.]*'
+
+sensor_veranda_temp_id = 3
+sensor_veranda_temp_cmd = sudo /usr/bin/read-temp /dev/hidraw1 | head -n 1 | cut -d ' ' -f 3 | grep -o '[0-9.]*'
+
+sensor_boite_temp_id = 1
+sensor_boite_temp_cmd = sudo /usr/bin/read-temp /dev/hidraw1 | tail -n 1 | cut -d ' ' -f 3 | grep -o '[0-9.]*'
+
+device_chauffage_veranda_id = 1
+device_chauffage_veranda_cmd_on = /usr/local/bin/gpio mode 10 out; /usr/local/bin/gpio write 10 0
+device_chauffage_veranda_cmd_off = /usr/local/bin/gpio mode 10 out; /usr/local/bin/gpio write 10 1
+
+device_chauffage_boite_id = 2
+device_chauffage_boite_cmd_on = /usr/local/bin/gpio mode 6 out; /usr/local/bin/gpio write 6 0
+device_chauffage_boite_cmd_off = /usr/local/bin/gpio mode 6 out; /usr/local/bin/gpio write 6 1
