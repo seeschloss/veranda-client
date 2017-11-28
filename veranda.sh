@@ -11,7 +11,7 @@ function log() {
 }
 
 function http_query() {
-	curl --silent "$@"
+	curl --silent -H "X-Api-Key: ${api_key}" "$@"
 }
 
 function config() {
@@ -23,6 +23,7 @@ function config() {
 	OLDIFS=$IFS
 	IFS="="; while read KEY VALUE; do
 		KEY="${KEY// }"
+		KEY="${KEY/-/_}"
 		VALUE="${VALUE/ }"
 		if test -n "$KEY" -a -n "$VALUE"; then
 			export $KEY=$VALUE
