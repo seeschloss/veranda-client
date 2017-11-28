@@ -42,7 +42,9 @@ function handle_sensor() {
 	log "Retrieving value for sensor $NAME, id #$ID..."
 	VALUE=$(eval $CMD)
 
-	http_query "https://veranda.seos.fr/data/sensor/${ID}?value=${VALUE}"
+	if test -n "$VALUE"; then
+		http_query "https://veranda.seos.fr/data/sensor/${ID}?value=${VALUE}"
+	fi
 }
 
 function handle_device() {
