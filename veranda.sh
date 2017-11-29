@@ -1,5 +1,7 @@
 #!/bin/bash
 
+VERSION=1
+API_BASE_URL="https://veranda.seos.fr/data"
 CONFIG_FILE="$HOME/.verandarc"
 
 function help() {
@@ -11,7 +13,7 @@ function log() {
 }
 
 function http_query() {
-	curl --silent -H "X-Api-Key: ${api_key}" "$@"
+	curl --silent -H "X-Veranda-Client-Version: ${VERSION}" -H "X-Api-Key: ${api_key}" "${API_BASE_URL}$@"
 }
 
 function config() {
@@ -43,7 +45,7 @@ function handle_sensor() {
 	VALUE=$(eval $CMD)
 
 	if test -n "$VALUE"; then
-		http_query "https://veranda.seos.fr/data/sensor/${ID}?value=${VALUE}"
+		http_query "/sensor/${ID}?value=${VALUE}"
 	fi
 }
 
@@ -55,25 +57,33 @@ function handle_device() {
 
 	log "Retrieving action for device $NAME, id #$ID..."
 
-	RESULT=$(http_query "https://veranda.seos.fr/data/device/${ID}")
+	RESULT=$(http_query "/device/${ID}")
 	echo "'$RESULT'"
 
 	if test "$RESULT" = "on"; then
 		eval $CMD_ON
 		if test "$?" -eq 0; then
-			http_query "https://veranda.seos.fr/data/device/${ID}?state=on"
+			http_query "/device/${ID}?state=on"
 		else
-			http_query "https://veranda.seos.fr/data/device/${ID}?state=error"
+			http_query "/device/${ID}?state=error"
 		fi
 	elif test "$RESULT" = "off"; then
 		eval $CMD_OFF
 		if test "$?" -eq 0; then
-			http_query "https://veranda.seos.fr/data/device/${ID}?state=off"
+			http_query "/device/${ID}?state=off"
 		else
-			http_query "https://veranda.seos.fr/data/device/${ID}?state=error"
+			http_query "/device/${ID}?state=error"
 		fi
 	else
-		http_query "https://veranda.seos.fr/data/device/${ID}?state=nop"
+		http_query "/device/${ID}?state=nop"
+	fi
+}
+
+function check_update() {
+	LATEST_VERSION=$(http_query "/client/latest-version")
+
+	if test "$LATEST_VERSION" -gt "$VERSION"; then
+		http_query "/client/latest-code" > /tmp/latest-veranda-client.sh
 	fi
 }
 
@@ -105,3 +115,7 @@ for device in $devices; do
 		handle_device "$device" "$DEVICE_ID" "$DEVICE_CMD_ON" "$DEVICE_CMD_OFF"
 	fi
 done
+
+if test $(( $RANDOM % 300 )) -eq 0; then
+	check_update
+fi
