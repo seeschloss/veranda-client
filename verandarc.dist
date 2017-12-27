@@ -1,5 +1,12 @@
+api-key = 0000000000000000000000000000000000000000
+
 sensors = terrasse_temp	terrasse_hygro veranda_temp boite_temp
 devices = chauffage_veranda chauffage_boite
+ble = veranda_sensorbug
+
+ble_veranda_sensorbug_id = 11
+ble_veranda_sensorbug_signal_id = 12
+ble_veranda_sensorbug_address = EC:FE:7E:10:9A:48
 
 sensor_terrasse_temp_id = 4
 sensor_terrasse_temp_cmd = sudo /usr/bin/read-temp /dev/hidraw3 | cut -d ' ' -f 3 | grep -o '[0-9.]*'
