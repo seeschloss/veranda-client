@@ -1,0 +1,13 @@
+[Unit]
+Description=SensorBug service
+
+[Service]
+Environment="HOME=/home/seeschloss"
+ExecStart=/usr/bin/python /home/seeschloss/src/veranda-client/beacon-listener.py
+ExecReload=/usr/bin/kill -HUP $MAINPID
+After=bluetooth.service
+KillMode=process
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
