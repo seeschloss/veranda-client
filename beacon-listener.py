@@ -43,9 +43,8 @@ adapter = dbus.Interface(proxy, "org.bluez.Adapter1")
 def signal_received_callback(beacon):
     def signal_received(*args, **kwargs):
         props = args[1]
-        print("Signal received", beacon, props)
 
-        if ('ManufacturerData' in props and 0x0085 in props['ManufacturerData']) and ('signal' in beacon):
+        if 'ManufacturerData' in props and 0x0085 in props['ManufacturerData'] and 'id' in beacon:
             # This is a SensorBug
             data = props['ManufacturerData'][0x0085]
             battery = int(data[3])
@@ -55,14 +54,20 @@ def signal_received_callback(beacon):
             print(temperature, 'C', battery, '%')
             headers = {"X-Api-Key": api_key}
             conn = Request('https://veranda.seos.fr/data/sensor/' + beacon['id'] + '?value=' + str(temperature) + '\&battery=' + str(battery), headers=headers)
-            urlopen(conn)
+            try:
+                print(urlopen(conn).read())
+            except Exception as e:
+                print("HTTP error", e)
 
-        if ('RSSI' in props) and ('signal_id' in beacon):
+        if 'RSSI' in props and 'signal_id' in beacon:
             signal = int(props['RSSI'])
             print('Signal strenght:', signal, 'dB')
             headers = {"X-Api-Key": api_key}
             conn = Request('https://veranda.seos.fr/data/sensor/' + beacon['signal_id'] + '?value=' + str(signal), headers=headers)
-            print(urlopen(conn).read())
+            try:
+                print(urlopen(conn).read())
+            except Exception as e:
+                print("HTTP error", e)
 
     return signal_received
 
