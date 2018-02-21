@@ -23,10 +23,13 @@ with open(os.getenv('HOME') + '/.verandarc', 'r') as lines:
 
     for beacon_name in beacon_names:
         if ('ble_' + beacon_name + '_address') in config['root']:
-            beacon = {'name': beacon_name, 'address': config['root']['ble_' + beacon_name + '_address']}
+            beacon = {'name': beacon_name, 'address': config['root']['ble_' + beacon_name + '_address'], 'last-battery': 0}
 
             if 'ble_' + beacon_name + '_id' in config['root']:
                 beacon['id'] = config['root']['ble_' + beacon_name + '_id']
+
+            if 'ble_' + beacon_name + '_humidity_id' in config['root']:
+                beacon['humidity_id'] = config['root']['ble_' + beacon_name + '_humidity_id']
 
             if 'ble_' + beacon_name + '_signal_id' in config['root']:
                 beacon['signal_id'] = config['root']['ble_' + beacon_name + '_signal_id']
@@ -44,6 +47,16 @@ def signal_received_callback(beacon):
     def signal_received(*args, **kwargs):
         props = args[1]
 
+        if 'ServiceData' in props and '0000feaa-0000-1000-8000-00805f9b34fb' in props['ServiceData']:
+            # This is an Eddystone frame, it gives us the battery voltage in mV
+            # this might be useful for the APlant devices that give us a soil humidity
+            # value instead of battery in their iBeacon frames
+            # AFAIK, they all run on 3V batteries
+            data = props['ServiceData']['0000feaa-0000-1000-8000-00805f9b34fb' ]
+            voltage_bytes = data[2:4]
+            voltage = (voltage_bytes[0] << 8) + voltage_bytes[1]
+            beacon['last-battery'] = (voltage/3000) * 100
+
         if 'ManufacturerData' in props and 0x0085 in props['ManufacturerData'] and 'id' in beacon:
             # This is a SensorBug
             data = props['ManufacturerData'][0x0085]
@@ -54,6 +67,44 @@ def signal_received_callback(beacon):
             print(temperature, 'C', battery, '%')
             headers = {"X-Api-Key": api_key}
             conn = Request('https://veranda.seos.fr/data/sensor/' + beacon['id'] + '?value=' + str(temperature) + '\&battery=' + str(battery), headers=headers)
+            try:
+                print(urlopen(conn).read())
+            except Exception as e:
+                print("HTTP error", e)
+
+        if 'ManufacturerData' in props and 0x004c in props['ManufacturerData'] and 'id' in beacon:
+            # This is an April Brother thingy (generic iBeacon?)
+            data = props['ManufacturerData'][0x004c]
+            battery = int(data[-3])
+            temperature = int(data[-2])
+            if temperature > 127:
+                temperature = temperature - 0x100
+
+            print(temperature, 'C', battery, '%')
+            headers = {"X-Api-Key": api_key}
+            conn = Request('https://veranda.seos.fr/data/sensor/' + beacon['id'] + '?value=' + str(temperature) + '\&battery=' + str(battery), headers=headers)
+            try:
+                print(urlopen(conn).read())
+            except Exception as e:
+                print("HTTP error", e)
+
+        if 'ManufacturerData' in props and 0x004c in props['ManufacturerData'] and 'humidity_id' in beacon:
+            # This is an April Brother thingy (generic iBeacon?)
+            # This section is for devices that report humidity instead of battery level
+            data = props['ManufacturerData'][0x004c]
+            humidity = int(data[-3])
+            temperature = int(data[-2])
+            if temperature > 127:
+                temperature = temperature - 0x100
+
+            print(temperature, 'C', humidity, '%')
+
+            string = 'value=' + str(humidity)
+            if beacon['last-battery'] > 0:
+                string = string + '\&battery=' + str(beacon['last-battery'])
+
+            headers = {"X-Api-Key": api_key}
+            conn = Request('https://veranda.seos.fr/data/sensor/' + beacon['humidity_id'] + '?' + string, headers=headers)
             try:
                 print(urlopen(conn).read())
             except Exception as e:
