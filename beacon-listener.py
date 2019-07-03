@@ -16,7 +16,7 @@ with open(os.getenv('HOME') + '/.verandarc', 'r') as lines:
     config.read_file(lines)
 
     if ('api-key' not in config['root']) or ('ble' not in config['root']):
-        os.exit(0)
+        sys.exit(0)
 
     api_key = config['root']['api-key']
     beacon_names = config['root']['ble'].split(" ")
@@ -46,6 +46,45 @@ adapter = dbus.Interface(proxy, "org.bluez.Adapter1")
 def signal_received_callback(beacon):
     def signal_received(*args, **kwargs):
         props = args[1]
+
+        if 'ServiceData' in props and '0000fe95-0000-1000-8000-00805f9b34fb' in props['ServiceData']:
+            # This is a Xiaomi Mija frame ("LYWSD02" sensor). It gives either temperature,
+            # humidity or battery depending on the 11th byte
+            data = props['ServiceData']['0000fe95-0000-1000-8000-00805f9b34fb' ]
+
+            data_type = data[12]
+            if data_type == 0x04:
+                # temperature
+                value = ((data[16] << 8) + data[15]) / 10.0
+                print (value, 'C')
+                headers = {"X-Api-Key": api_key}
+                conn = Request('https://veranda.seos.fr/data/sensor/' + beacon['id'] + '?value=' + str(value), headers=headers)
+                try:
+                    print(urlopen(conn).read())
+                except Exception as e:
+                    print("HTTP error", e)
+
+            elif data_type == 0x06:
+                # humidity
+                value = ((data[16] << 8) + data[15]) / 10.0
+                print (value, '%')
+                headers = {"X-Api-Key": api_key}
+                conn = Request('https://veranda.seos.fr/data/sensor/' + beacon['humidity_id'] + '?value=' + str(value), headers=headers)
+                try:
+                    print(urlopen(conn).read())
+                except Exception as e:
+                    print("HTTP error", e)
+
+            elif data_type == 0x0a:
+                # battery
+                print (data)
+                value = (data[16] << 8) + data[15]
+                print (value, ' battery')
+                beacon['last-battery'] = value
+
+            else:
+                print ("Unknown data type:", data_type)
+                print (data)
 
         if 'ServiceData' in props and '0000feaa-0000-1000-8000-00805f9b34fb' in props['ServiceData']:
             # This is an Eddystone frame, it gives us the battery voltage in mV
