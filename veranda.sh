@@ -33,6 +33,10 @@ function config() {
 	done < "$FILE"
 	IFS=$OLDIFS
 
+	if test -n "$url"; then
+		API_BASE_URL="$url"
+	fi
+
 	return
 }
 
