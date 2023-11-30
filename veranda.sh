@@ -28,7 +28,9 @@ function config() {
 		KEY="${KEY/-/_}"
 		VALUE="${VALUE/ }"
 		if test -n "$KEY" -a -n "$VALUE"; then
-			export $KEY=$VALUE
+			IFS=$OLDIFS
+			export "$KEY"="$VALUE"
+			IFS="="
 		fi
 	done < "$FILE"
 	IFS=$OLDIFS
