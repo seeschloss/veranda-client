@@ -130,6 +130,7 @@ class HTTP_EC200A:
 
         self.send_command(f'AT+QHTTPCFG="reqheader/add","Content-Type","image/jpeg"')
         self.send_command(f'AT+QHTTPPOST={len(data)},120', data=data, timeout=120000)
+        self.send_command(f'AT+QHTTPCFG="reqheader/remove","Content-Type"')
 
     def send_http_get(self, url, read_timeout=5):
         self.send_command(f'AT+QHTTPSTOP')
@@ -151,6 +152,7 @@ class HTTP_EC200A:
 
         self.send_command(f'AT+QHTTPCFG="reqheader/add","Content-Type","application/json"')
         self.send_command(f'AT+QHTTPPOST={len(data)},60', data=data, timeout=5000)
+        self.send_command(f'AT+QHTTPCFG="reqheader/remove","Content-Type"')
 
 
     def init_modem(self, timeout=10000):
@@ -172,9 +174,8 @@ class HTTP_EC200A:
 
         # On essaie de passer en connexion un peu plus rapide...
         # je pense que pour dépasser 460800 il va falloir utiliser CTS, DTC, ce genre de trucs
-        self.set_uart_speed(921600)
         #self.set_uart_speed(460800)
-        #self.set_uart_speed(230400)
+        self.set_uart_speed(230400)
 
         return self.network_registration()
 

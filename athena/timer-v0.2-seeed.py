@@ -6,13 +6,46 @@ import alarm
 import time
 import board
 
-from ble import BLE
-
+import _bleio
 import struct
+
 import time
 
+def broadcast_values(values, timeout = 10, name="ATHENA"):
+    print("Advertising through BLE")
+    advertisement = struct.pack("<" "BB" "B"
+                                    "BB" "6s"
+                                    "BB" "BB" "B",
+        2, 1, 6, # Flags / LE General Discoverable && BR/EDR Not Supported
+        len("ATHENA") + 1, 9, "ATHENA", # Complete local name
+        3 + (len(values) * (1 + 4)), 0xFF, 0x89, 0x17, # Manufacturer data / Mf ID 0x17 0x89
+            len(values)
+    )
+
+    print(values)
+    for sensor_id, sensor_value in values.items():
+        advertisement += struct.pack("<Bf", sensor_id, sensor_value)
+
+    _bleio.adapter.start_advertising(advertisement, connectable=False, timeout=timeout)
+
+def broadcast_values_text(values, timeout = 10, name="ATHENA"):
+    print("Advertising through BLE")
+    data_string = f"{values}"
+    advertisement = struct.pack("<" "BB" "B"
+                                    "BB" "6s"
+                                    "BB" "BB" f"{len(data_string)}s",
+        2, 1, 6, # Flags / LE General Discoverable && BR/EDR Not Supported
+        len("ATHENA") + 1, 9, "ATHENA", # Complete local name
+        3 + len(data_string), 0xFF, 0x89, 0x17, # Manufacturer data / Mf ID 0x17 0x89
+            data_string
+    )
+
+    print(values)
+
+    _bleio.adapter.start_advertising(advertisement, connectable=False, timeout=timeout)
+
 TIMEOUT_SECONDS = 160
-ESP_SLEEP_TIME = 60 * 30
+ESP_SLEEP_TIME = 60 * 20
 NRF_SLEEP_TIME = 10
 
 TIME_TO_WAKEUP = struct.unpack("<I", alarm.sleep_memory[0:4])[0]
@@ -39,12 +72,12 @@ adc_psu =          analogio.AnalogIn(board.A1)
 
 vbat_enable = digitalio.DigitalInOut(board.READ_BATT_ENABLE)
 vbat_enable.switch_to_output()
-vbat_enable.value = 0
+vbat_enable = 0
 adc_battery_2 =    analogio.AnalogIn(board.VBATT)
 voltage_battery_2 = adc_battery_2.value * 3.3 / 2**16 * 1510/510
 # d'où vient cette formule, c'est pas clair, je l'ai reprise de :
 # https://forum.seeedstudio.com/t/xiao-nrf52840-battery-voltage-not-readable-on-platformio/268637
-vbat_enable.value = 1
+vbat_enable = 1
 
 voltage_battery   = adc_battery.value / 2**16 * 3.3 * 2
 voltage_supply    = adc_psu.value / 2**16 * 3.3 * 2
@@ -62,13 +95,20 @@ print(f"Battery voltage: {voltage_battery} V")
 print(f"Battery voltage 2: {voltage_battery_2} V")
 print(f"Supply voltage: {voltage_supply} V")
 
-ble = BLE("ATHENA")
-ble.broadcast_values({0: voltage_supply, 1: voltage_battery_2, 2: 0, 3: 0}, timeout=30)
-
 if (TIME_TO_WAKEUP > 0):
-    time.sleep(5)
-
     alarm.sleep_memory[0:4] = struct.pack("<I", TIME_TO_WAKEUP - NRF_SLEEP_TIME)
+
+    # On se réveille régulièrement pour envoyer l'état du truc
+    broadcast_values_text({SENSOR_ID_SUPPLY_VOLTAGE: voltage_supply,
+                      SENSOR_ID_SUPPLY_CURRENT: 0,
+                      SENSOR_ID_BATTERY_VOLTAGE: voltage_battery_2,
+                      SENSOR_ID_BATTERY_CURRENT: 0,
+                      SENSOR_ID_BOARD_CURRENT: 0,
+                      SENSOR_ID_TEMPERATURE: microcontroller.cpu.temperature,
+                      "reason": microcontroller.cpu.reset_reason,
+                      "ttl": TIME_TO_WAKEUP,
+                      },
+                     timeout=10, name="ATHENA")
 
     print(f"It is not yet time to run the ESP: time to wakeup is {TIME_TO_WAKEUP}s, sleeping for {NRF_SLEEP_TIME}s")
     time_alarm = alarm.time.TimeAlarm(monotonic_time=time.monotonic() + NRF_SLEEP_TIME)
@@ -115,14 +155,20 @@ if False and voltage_supply < 2:
 
 pin_power.value = 1
 
+broadcast_values_text({
+                  "reason": microcontroller.cpu.reset_reason,
+                  "ttl": TIME_TO_WAKEUP,
+                  },
+                 timeout=10, name="ATHENA")
+
 print("Sleeping to let Athena do her job")
-# 30 secondes pour laisser Athena prendre une photo
-time.sleep(30)
+# 10 secondes pour pouvoir se connecter au REPL micropython
+time.sleep(10)
 led_B.value = 1
 
 print("Waiting for a signal or timeout")
 # D'après mes tests, 120 secondes suffisent (normalement ça prend ~75 secondes)
-time_alarm = alarm.time.TimeAlarm(monotonic_time=time.monotonic() + TIMEOUT_SECONDS - 30 - 5)
+time_alarm = alarm.time.TimeAlarm(monotonic_time=time.monotonic() + TIMEOUT_SECONDS - 10 - 5)
 wake_alarm = alarm.light_sleep_until_alarms(time_alarm, pin_alarm)
 
 if wake_alarm == pin_alarm:

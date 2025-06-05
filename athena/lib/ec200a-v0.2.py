@@ -234,7 +234,7 @@ class HTTP_EC200A:
         self.send_command(f'AT+QHTTPCFG="reqheader/add","Content-Type","image/jpeg"')
 
         length = len(data)
-        return self.send_command(f'AT+QHTTPPOST={length},150,150', data=data, timeout=25000)
+        return self.send_command(f'AT+QHTTPPOST={length},150,150', data=data, timeout=150000)
 
     def send_file_upl(self, url, data):
         self.send_command(f'AT+QFDEL="UFS:img.dat"')
@@ -341,24 +341,14 @@ class HTTP_EC200A:
             time.sleep(0.5)
             response, lines = self.send_command("ATE0")
 
+        # Si le modem n'est pas encore prêt après le timeout, on doit essayer des trucs
         if response != "OK":
-            # Si le modem n'est pas encore prêt après le timeout, on essaie encore un coup
-            # mais avec la vitesse après initialisation, au cas où le modem n'aurait pas
-            # été éteint correctement
-            self.uart.baudrate = baudrate
-            start_time = supervisor.ticks_ms()
-            while (ticks_diff(supervisor.ticks_ms(), start_time) < timeout) and response != "OK":
-                time.sleep(0.5)
-                response, lines = self.send_command("ATE0")
-
-            # Sinon, on abandonne
-            if response != "OK":
-                return False
+            return False
 
         # On ne veut pas de message non sollicités
-        #self.send_command("AT+CGEREP=1,0")
-        #self.send_command("AT+CEREG=0")
-        #self.send_command("AT+CGREG=0")
+        self.send_command("AT+CGEREP=1,0")
+        self.send_command("AT+CEREG=0")
+        self.send_command("AT+CGREG=0")
 
         if baudrate > 115200:
             # On essaie de passer en connexion un peu plus rapide...
@@ -398,13 +388,10 @@ class HTTP_EC200A:
         # Activation des fonctionnalités complètes
         self.send_command("AT+CFUN=1", 9000, expect=r"OK")
         self.send_command("ATE0")
-        self.send_command("AT+CREG=2")
-        self.send_command('AT+QINDCFG="all",1,1')
-        self.send_command('AT+QURCCFG?')
 
         self.debug("Checking network registration")
         response, lines = self.send_command("AT+CREG?", expect=r'.*CREG:.*$', ignore_URCs=False)
-        r = re.compile(r'.*CREG: .,[1,5].*$')
+        r = re.compile(r'.*CREG: 0,[1,5].*$')
         start_time = supervisor.ticks_ms()
         while (ticks_diff(supervisor.ticks_ms(), start_time) < timeout) and not r.match(response.strip()):
             time.sleep(0.5)
@@ -420,16 +407,5 @@ class HTTP_EC200A:
 
     def modem_shutdown(self):
         self.send_command("AT+CFUN=0", 1000)
-        self.send_command("AT+QSCLK=2", 1000)
-        self.send_command("AT+QPOWD=1", 1000)
-
-    def list_operators(self):
-        # Must disconnect first to scan
-        self.send_command("AT+CGATT=0")
-        return self.send_command("AT+COPS=?", 15000)
-
-    def select_operator(self, operator):
-        # Must disconnect first
-        self.send_command("AT+CGATT=0")
-        return self.send_command(f'AT+COPS=4,0,"{operator}"', 15000)
+        self.send_command("AT+QCSCLK=1", 1000)
 
