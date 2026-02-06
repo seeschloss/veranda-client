@@ -70,6 +70,19 @@ except Exception as e:
     print(f"Cannot take picture: {e}")
     img = None
 
+network_time = 0
+uart = busio.UART(rx=pin_EC_rx, tx=pin_EC_tx, baudrate=115200)
+http = HTTP_EC200A(uart, [
+    ("X-Board-Id", microcontroller.cpu.uid.hex()),
+    ("User-Agent", f"Athena/{FIRMWARE_VERSION} (CircuitPython, EC200A-EU)"),
+])
+if http.init_modem(baudrate=921600, timeout=25000):
+    time.sleep(2)
+    network_time = http.network_time()
+
+    print(f"Network time: {network_time}")
+
+
 if img is not None:
     print(f"Picture size: {len(img)}")
 
@@ -78,7 +91,14 @@ if img is not None:
     try:
         sd = sdcardio.SDCard(board.SPI(), board.SDCS)
         dcim = DCIM(sd)
-        (result, filename) = dcim.store(img, ".JPG")
+
+        if network_time > 0:
+            t = time.localtime(network_time)
+            timestamp = "{:04d}{:02d}{:02d}{:02d}{:02d}".format(*t[:5])
+        else:
+            timestamp = ""
+
+        (result, filename) = dcim.store(img, ".JPG", "." + timestamp)
         if result:
             print(f"Image saved as '{filename}'")
         else:
@@ -102,20 +122,12 @@ pin_sleep_signal.switch_to_output()
 pin_sleep_signal.value = 0
 
 try:
-    uart = busio.UART(rx=pin_EC_rx, tx=pin_EC_tx, baudrate=115200)
-    http = HTTP_EC200A(uart, [
-        ("X-Board-Id", microcontroller.cpu.uid.hex()),
-        ("User-Agent", f"Athena/{FIRMWARE_VERSION} (CircuitPython, EC200A-EU)"),
-    ])
-
-    if http.init_modem(baudrate=921600, timeout=25000):
-        time.sleep(2)
-        network_time = http.network_time()
-
-        print(f"Network time: {network_time}")
-
+    if http.network_registration():
         img_size = 0
         if img is not None:
+            if dcim and filename:
+                print(f"Adding timestamp ({timestamp}) to file ({filename})")
+                dcim.add_timestamp(filename, timestamp)
             img_size = len(img)
 
         http.send_http_post_json(f"{ATHENA_URL}/data/sensor", json.dumps({
