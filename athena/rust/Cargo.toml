@@ -1,0 +1,55 @@
+[package]
+name = "xiao-camera-rust"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+[dependencies]
+atomic_float = { version = "*", default-features = false }
+esp-idf-hal = "*"
+esp-idf-sys = { version = "*", features = ["binstart", "native"] }
+esp-idf-svc = "*"
+embedded-svc = "*"
+embedded-hal = "*"
+anyhow = "*"
+log = "*"
+esp-camera-rs = { path = "esp-camera-rs" }
+#esp-camera-rs = { git = "https://github.com/hnz1102/esp-camera-rs" }
+
+heapless = "*"
+
+atat = "*"
+ina3221 = "0.4.5"
+
+[build-dependencies]
+embuild = "*"
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[[bin]]
+name = "xiao-camera-rust"
+harness = false
+
+[package.metadata.esp-idf-sys]
+# This will automatically generate UF2 after build
+extra_components = [
+    { name = "esp_tinyuf2", git = "https://github.com/espressif/esp-iot-solution.git", path = "components/usb/esp_tinyuf2" }
+]
+
+
+#[env]
+#lib_deps = "esp32-camera"
+
+#[[package.metadata.esp-idf-sys.extra_components]]
+#remote_component = { name = "espressif/esp32-camera", version = "2.1.0" }
+#bindings_header = "bindings.h"
+#bindings_module = "camera"
+
+
+[package.metadata.espflash]
+partition_table = "partitions.csv"
