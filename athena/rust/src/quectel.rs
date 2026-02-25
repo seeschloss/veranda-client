@@ -9,7 +9,27 @@ use log::info;
 use anyhow::{anyhow, Result, bail};
 use std::time::Duration;
 use std::thread;
-use esp_idf_hal::delay::FreeRtos;
+
+#[derive(Debug)]
+pub struct QuectelError {
+    details: String
+}
+
+impl QuectelError {
+    pub fn new(msg: &str)-> Self {
+        Self{details: msg.to_owned()}
+    }
+}
+impl std::fmt::Display for QuectelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>)-> Result<(), std::fmt::Error> {
+        write!(f, "{}", self.details)
+    }
+}
+impl std::error::Error for QuectelError {
+    fn description(&self) -> &str {
+        &self.details
+    }
+}
 
 pub struct QuectelModule<'a, P1: OutputPin, P2: OutputPin> {
     uart: UartDriver<'a>,
@@ -84,6 +104,32 @@ impl<'a, P1: OutputPin, P2: OutputPin> QuectelModule<'a, P1, P2> {
         info!("Sending: {}", command);
         self.uart.write(format!("{}\r\n", command).as_bytes())?;
         self.wait_for_response(expected, timeout, false)
+    }
+
+    pub fn send_at_command_until(&mut self, command: &str, expected: &str, timeout: Duration, tries: i32) -> Result<String, QuectelError> {
+        let mut retries = tries;
+
+        let mut result = Err(QuectelError::new("plop"));
+
+        while retries > 0 {
+            match self.send_at_command(command, expected, timeout) {
+                Ok(response) => {
+                    if response.contains(expected) {
+                        return Ok(response);
+                    } else {
+                        result = Err(QuectelError::new(format!("Expected response containing `{}` but received `{}`", expected, response).as_str()));
+                    }
+                },
+                Err(e) => {
+                    info!("SIM card not ready ({})", e);
+                    result = Err(QuectelError::new(e.to_string().as_str()));
+                },
+            };
+
+            retries -= 1;
+        }
+
+        result
     }
 
     pub fn wait_for_response(&mut self, expected: &str, timeout: Duration, silent: bool) -> Result<String> {
@@ -246,30 +292,13 @@ impl<'a, P1: OutputPin, P2: OutputPin> QuectelModule<'a, P1, P2> {
         //self.detect_and_set_uart_speed(Hertz(460800))?;
 
         // Test communication
-        self.send_at_command("AT", "OK", Duration::from_secs(5))?;
+        self.send_at_command_until("AT", "OK", Duration::from_secs(5), 30)?;
 
         // Disable echo
         self.send_at_command("ATE0", "OK", Duration::from_secs(1))?;
 
         // Check SIM card
-        let mut retries = 10;
-        while retries > 0 {
-            match self.send_at_command("AT+CPIN?", "READY", Duration::from_secs(1)) {
-                Ok(response) => {
-                    if response.contains("READY") {
-                        retries = 0;
-                        info!("SIM card ready ({})", response);
-                    } else {
-                        info!("SIM card not ready ({})", response);
-                    }
-                },
-                Err(e) => {
-                    info!("SIM card not ready ({})", e);
-                },
-            }
-
-            retries -= 1;
-        }
+        self.send_at_command_until("AT+CPIN?", "OK", Duration::from_secs(1), 10)?;
 
         // Verbose debugging
         //self.send_at_command("AT+CMEE=2", "OK", Duration::from_secs(30))?;
