@@ -20,10 +20,12 @@ use std::thread;
 
 mod dcim;
 mod quectel;
+mod simcom;
 mod wifi;
 
 use dcim::{SDSPIHost, DCIM};
 use quectel::QuectelModule;
+use simcom::SimcomModule;
 use wifi::wifi;
 
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
@@ -145,6 +147,15 @@ fn main() {
         }
     };
 
+    let mut led_pin = match PinDriver::output(peripherals.pins.gpio21) {
+        Ok(led_pin) => Some(led_pin),
+        Err(_) => None,
+    };
+
+    if let Some(ref mut led_pin) = led_pin {
+        let _ = led_pin.set_low();
+    }
+
     if let Ok(i2c) = i2c::I2cDriver::new(
         peripherals.i2c0,
         peripherals.pins.gpio5,
@@ -178,7 +189,7 @@ fn main() {
             };
 
             match PinDriver::output(peripherals.pins.gpio3) { // D2
-                Ok(power_pin) => Some(QuectelModule::new(uart, power_pin, sleep_pin)),
+                Ok(power_pin) => Some(SimcomModule::new(uart, power_pin, sleep_pin)),
                 Err(e) => {
                     println!("Failed to initialize 4G module power pin: {:?}, continuing without 4G", e);
                     None
@@ -316,22 +327,22 @@ fn main() {
                     }
 
                     if let Some(ref mut gsm_module) = gsm_module {
-                        if let Err(e) = gsm_module.wake() {
-                            info!("Could not power on 4G module: {:?} (but maybe it's already powered on)", e);
-                        }
+                        //if let Err(e) = gsm_module.wake() {
+                        //    info!("Could not power on 4G module: {:?} (but maybe it's already powered on)", e);
+                        //}
 
                         if let Err(e) = gsm_module.initialize_network("simbase") {
                             info!("Could not initialise 4G module: {:?} (but maybe it's already initialised)", e);
                         }
 
-                        let quectel_voltage = match gsm_module.battery_voltage() {
+                        let modem_voltage = match gsm_module.battery_voltage() {
                             Ok(voltage) => voltage,
                             Err(e) => {
                                 info!("Couldn't read 4G module voltage: {}", e);
                                 0.0
                             },
                         };
-                        info!("Battery voltage according to the 4G module is: {}", quectel_voltage);
+                        info!("Battery voltage according to the 4G module is: {}", modem_voltage);
 
                         let headers = [
                             ("Content-Type", "application/json"),
@@ -345,7 +356,7 @@ fn main() {
                             "board_current", format!("{{ \"type\":\"current\",\"value\":{} }}", shared_box.ch3_current.load(Ordering::Relaxed) as f32 / 1000.0),
                             "battery_charging_current", format!("{{ \"type\":\"current\",\"value\":{} }}", shared_box.ch2_current.load(Ordering::Relaxed) as f32 / 1000.0),
                             "supply_current", format!("{{ \"type\":\"current\",\"value\":{} }}", shared_box.ch1_current.load(Ordering::Relaxed) as f32 / 1000.0),
-                            "quectel_voltage", format!("{{ \"type\":\"voltage\",\"value\":{} }}", quectel_voltage),
+                            "quectel_voltage", format!("{{ \"type\":\"voltage\",\"value\":{} }}", modem_voltage),
                             "photo_size", format!("{{ \"type\":\"generic\",\"value\":{} }}", image_data.len()),
                         );
 
@@ -386,7 +397,7 @@ fn main() {
 
                         info!("CPU0 power data: {:?}", shared_box);
 
-                        let _ = gsm_module.sleep();
+                        //let _ = gsm_module.sleep();
                     }
 
                     camera.return_framebuffer(frame);
@@ -399,13 +410,19 @@ fn main() {
 
         info!("Sleeping for {} minute(s), now.", SLEEP_MINUTES);
 
+        if let Some(ref mut led_pin) = led_pin {
+            let _ = led_pin.set_high();
+        }
+
         shared_bool_task_running.clone().store(false, Ordering::SeqCst);
         std::thread::sleep(std::time::Duration::from_millis(100));
-        //thread::sleep(Duration::from_secs(60 * SLEEP_MINUTES));
+        thread::sleep(Duration::from_secs(60 * SLEEP_MINUTES));
+        /*
         unsafe {
             esp_sleep_enable_timer_wakeup(SLEEP_MINUTES * 60 * 1_000_000);
             esp_deep_sleep_start();
         }
+        */
     }
 }
 
