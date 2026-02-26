@@ -1,3 +1,0 @@
-[submodule "athena/rust/athena/rust/esp-camera-rs"]
-	path = athena/rust/athena/rust/esp-camera-rs
-	url = https://github.com/hnz1102/esp-camera-rs

@@ -5,7 +5,6 @@ edition = "2021"
 resolver = "2"
 
 [dependencies]
-atomic_float = { version = "*", default-features = false }
 esp-idf-hal = "*"
 esp-idf-sys = { version = "*", features = ["binstart", "native"] }
 esp-idf-svc = "*"
@@ -17,8 +16,6 @@ esp-camera-rs = { path = "esp-camera-rs" }
 #esp-camera-rs = { git = "https://github.com/hnz1102/esp-camera-rs" }
 
 heapless = "*"
-
-atat = "*"
 ina3221 = "0.4.5"
 
 [build-dependencies]
