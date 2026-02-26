@@ -81,8 +81,8 @@ impl<'a, P1: OutputPin, P2: OutputPin> SimcomModule<'a, P1, P2> {
     ///
     /// The A7670 hardware reference recommends pulling PWRKEY low for at least
     /// 1 second; the module will begin its boot sequence once the pin is
-    /// released.  Wait an additional ~5 s for the firmware to fully initialise
-    /// before sending any AT commands.
+    /// released.  Rather than waiting a fixed delay we poll `AT` in a loop
+    /// until the modem acknowledges, then set full-functionality mode.
     pub fn power_on(&mut self) -> Result<()> {
         info!("Powering on modem (PWRKEY pulse)...");
 
@@ -92,13 +92,50 @@ impl<'a, P1: OutputPin, P2: OutputPin> SimcomModule<'a, P1, P2> {
         thread::sleep(Duration::from_millis(1500)); // ≥1 s per datasheet
         self.power_pin.set_high()?;                  // release
 
-        // Allow the module to complete its internal boot sequence.
-        thread::sleep(Duration::from_secs(5));
+        // Poll AT until the modem responds, with a generous overall timeout.
+        // The A7670 typically boots in 3–8 s; allow up to 30 s for cold starts
+        // on a low battery or slow power rail.
+        self.wait_for_at_ready(Duration::from_secs(30))?;
 
-        // Confirm the modem is alive and set it to full-functionality mode.
-        self.send_at_command("AT+CFUN=1", "OK", Duration::from_secs(10))?;
+        // Disable echo now so every subsequent response is predictable.
+        self.send_at_command("ATE0", "OK", Duration::from_secs(5))?;
+
+        // Set to full-functionality mode (RF on, SIM powered).
+        // Use send_at_command_until because the module can still be
+        // initialising its radio stack and return ERROR for a short window
+        // right after it first responds to AT.
+        self.send_at_command_until("AT+CFUN=1", "OK", Duration::from_secs(5), 5)
+            .map_err(|e| anyhow!("AT+CFUN=1 failed: {}", e))?;
+
+        // Brief settle time for the radio to come up after CFUN=1.
         thread::sleep(Duration::from_secs(2));
+        info!("Modem powered on and ready");
         Ok(())
+    }
+
+    /// Poll `AT` every 500 ms until the modem replies `OK`, or `timeout`
+    /// elapses.  Used after power-on and after reset to avoid fixed sleeps.
+    fn wait_for_at_ready(&mut self, timeout: Duration) -> Result<()> {
+        info!("Waiting for modem to become responsive (AT poll)...");
+        let start = std::time::Instant::now();
+        let mut attempt = 0u32;
+
+        while start.elapsed() < timeout {
+            attempt += 1;
+            match self.send_at_command("AT", "OK", Duration::from_millis(1000)) {
+                Ok(_) => {
+                    info!("Modem responded to AT after {} attempt(s) ({:.1}s)",
+                        attempt, start.elapsed().as_secs_f32());
+                    return Ok(());
+                }
+                Err(_) => {
+                    // Modem still booting — wait before retrying.
+                    thread::sleep(Duration::from_millis(500));
+                }
+            }
+        }
+
+        bail!("Modem did not respond to AT within {}s", timeout.as_secs());
     }
 
     /// Power off the A7670 cleanly via AT command followed by a PWRKEY pulse.
@@ -385,19 +422,29 @@ impl<'a, P1: OutputPin, P2: OutputPin> SimcomModule<'a, P1, P2> {
     pub fn initialize_network(&mut self, apn: &str) -> Result<()> {
         info!("Initializing network connection...");
 
-        // Test communication.
+        // ── 1. Confirm the modem is talking to us ───────────────────────────
         self.send_at_command_until("AT", "OK", Duration::from_secs(5), 30)?;
 
-        // Disable echo.
-        self.send_at_command("ATE0", "OK", Duration::from_secs(1))?;
+        // Disable echo (may already be off from power_on, but belt-and-braces).
+        let _ = self.send_at_command("ATE0", "OK", Duration::from_secs(2));
 
-        // Check SIM card.
-        self.send_at_command_until("AT+CPIN?", "OK", Duration::from_secs(1), 10)?;
+        // ── 2. Wait for SIM card to be ready ────────────────────────────────
+        // The SIM can take several seconds to initialise after CFUN=1.
+        self.wait_for_sim_ready(Duration::from_secs(30))?;
 
-        // Signal quality.
-        self.send_at_command("AT+CSQ", "OK", Duration::from_secs(30))?;
+        // ── 3. Wait for network registration ────────────────────────────────
+        // Enable unsolicited registration URCs, then poll until the modem
+        // reports it is registered on the home network or roaming.
+        self.send_at_command("AT+CREG=1",  "OK", Duration::from_secs(5))?;
+        self.send_at_command("AT+CGREG=1", "OK", Duration::from_secs(5))?;
+        self.send_at_command("AT+CEREG=1", "OK", Duration::from_secs(5))?;
 
-        // Configure PDP context (standard 3GPP – identical on both modules).
+        self.wait_for_network_registration(Duration::from_secs(90))?;
+
+        // ── 4. Confirm signal quality is usable (CSQ != 99) ─────────────────
+        self.wait_for_signal(Duration::from_secs(30))?;
+
+        // ── 5. Configure PDP context ─────────────────────────────────────────
         // Do NOT manually call AT+CGACT here: on the A7670 the bearer is
         // managed entirely by AT+NETOPEN / AT+NETCLOSE.  Calling CGACT=0
         // underneath an open network session triggers "+CGEV: NW PDN DEACT"
@@ -406,15 +453,7 @@ impl<'a, P1: OutputPin, P2: OutputPin> SimcomModule<'a, P1, P2> {
         let pdp_cmd = format!("AT+CGDCONT=1,\"IP\",\"{}\"", apn);
         self.send_at_command(&pdp_cmd, "OK", Duration::from_secs(5))?;
 
-        // Registration status (identical URCs on both modules).
-        self.send_at_command("AT+CREG=1", "OK", Duration::from_secs(30))?;
-        self.send_at_command("AT+CREG?", "OK", Duration::from_secs(30))?;
-        self.send_at_command("AT+CGREG?", "OK", Duration::from_secs(30))?;
-        self.send_at_command("AT+CEREG?", "OK", Duration::from_secs(30))?;
-        self.send_at_command("AT+CGREG=1", "OK", Duration::from_secs(30))?;
-        self.send_at_command("AT+CEREG=1", "OK", Duration::from_secs(30))?;
-
-        // Open the network service.
+        // ── 6. Open the network service ──────────────────────────────────────
         // AT+NETOPEN activates the internal TCP/IP stack; equivalent to
         // AT+QIACT on Quectel but with a different URC (+NETOPEN:).
         // If the network is already open the module replies with
@@ -432,12 +471,138 @@ impl<'a, P1: OutputPin, P2: OutputPin> SimcomModule<'a, P1, P2> {
             }
         }
 
-        // Confirm an IP address was assigned.
+        // ── 7. Confirm an IP address was assigned ────────────────────────────
         self.send_at_command("AT+CGPADDR=1", "+CGPADDR:", Duration::from_secs(5))?;
 
         self.is_connected = true;
         info!("Network connection established");
         Ok(())
+    }
+
+    /// Wait up to `timeout` for the SIM card to report `+CPIN: READY`.
+    ///
+    /// On a cold start the SIM can take several seconds to power up and
+    /// complete its initialisation even after the modem is already responding
+    /// to AT commands.
+    fn wait_for_sim_ready(&mut self, timeout: Duration) -> Result<()> {
+        info!("Waiting for SIM card to be ready...");
+        let start = std::time::Instant::now();
+
+        while start.elapsed() < timeout {
+            match self.send_at_command("AT+CPIN?", "OK", Duration::from_secs(3)) {
+                Ok(resp) if resp.contains("+CPIN: READY") => {
+                    info!("SIM card ready ({:.1}s)", start.elapsed().as_secs_f32());
+                    return Ok(());
+                }
+                Ok(resp) if resp.contains("+CPIN: SIM PIN") => {
+                    bail!("SIM card requires a PIN – cannot proceed");
+                }
+                Ok(resp) if resp.contains("+CPIN: SIM PUK") => {
+                    bail!("SIM card is PUK-locked – cannot proceed");
+                }
+                Ok(_) | Err(_) => {
+                    // Not ready yet – wait and retry.
+                    thread::sleep(Duration::from_secs(1));
+                }
+            }
+        }
+
+        bail!("SIM card was not ready within {}s", timeout.as_secs());
+    }
+
+    /// Poll registration status until the modem is registered (home or
+    /// roaming) on at least one of CREG / CGREG / CEREG, or `timeout` elapses.
+    ///
+    /// Registered states per 3GPP TS 27.007:
+    ///   1 = registered, home network
+    ///   5 = registered, roaming
+    fn wait_for_network_registration(&mut self, timeout: Duration) -> Result<()> {
+        info!("Waiting for network registration (up to {}s)...", timeout.as_secs());
+        let start = std::time::Instant::now();
+
+        // Helper: extract the numeric stat field from "+CREG: <n>,<stat>" or
+        // "+CREG: <stat>" and return true if it indicates registered.
+        fn is_registered(response: &str, prefix: &str) -> bool {
+            if let Some(pos) = response.find(prefix) {
+                let after = response[pos + prefix.len()..].trim_start();
+                // The stat value is either the first token ("+CREG: 1") or the
+                // second comma-separated token ("+CREG: 0,1").
+                let stat_str = if let Some(comma) = after.find(',') {
+                    &after[comma + 1..]
+                } else {
+                    after
+                };
+                let stat: u32 = stat_str
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse()
+                    .unwrap_or(0);
+                return stat == 1 || stat == 5;
+            }
+            false
+        }
+
+        let mut last_stat_log = start;
+
+        while start.elapsed() < timeout {
+            // Query all three registration commands; any one registering is enough.
+            let creg  = self.send_at_command("AT+CREG?",  "OK", Duration::from_secs(5)).unwrap_or_default();
+            let cgreg = self.send_at_command("AT+CGREG?", "OK", Duration::from_secs(5)).unwrap_or_default();
+            let cereg = self.send_at_command("AT+CEREG?", "OK", Duration::from_secs(5)).unwrap_or_default();
+
+            if is_registered(&creg, "+CREG:")
+                || is_registered(&cgreg, "+CGREG:")
+                || is_registered(&cereg, "+CEREG:")
+            {
+                info!("Network registered ({:.1}s)", start.elapsed().as_secs_f32());
+                return Ok(());
+            }
+
+            // Log progress every 10 s so the user can see something is happening.
+            if last_stat_log.elapsed() >= Duration::from_secs(10) {
+                info!("Still waiting for registration… ({:.0}s elapsed)",
+                    start.elapsed().as_secs_f32());
+                last_stat_log = std::time::Instant::now();
+            }
+
+            thread::sleep(Duration::from_secs(2));
+        }
+
+        bail!("Network registration timed out after {}s", timeout.as_secs());
+    }
+
+    /// Wait until `AT+CSQ` returns a signal-quality value other than 99
+    /// (which means "unknown / not detectable").
+    fn wait_for_signal(&mut self, timeout: Duration) -> Result<()> {
+        info!("Waiting for usable signal (CSQ != 99)...");
+        let start = std::time::Instant::now();
+
+        while start.elapsed() < timeout {
+            if let Ok(resp) = self.send_at_command("AT+CSQ", "OK", Duration::from_secs(5)) {
+                // Response: "+CSQ: <rssi>,<ber>"  where rssi 0-31 are valid,
+                // 99 means not known / not detectable.
+                if let Some(pos) = resp.find("+CSQ:") {
+                    let after = resp[pos + 5..].trim_start();
+                    let rssi_str: String = after
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    if let Ok(rssi) = rssi_str.parse::<u32>() {
+                        if rssi != 99 {
+                            // Convert to rough dBm for a useful log message.
+                            let dbm = -113i32 + (rssi as i32) * 2;
+                            info!("Signal quality: CSQ={} (~{}dBm) ({:.1}s)",
+                                rssi, dbm, start.elapsed().as_secs_f32());
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_secs(2));
+        }
+
+        bail!("No usable signal (CSQ=99) within {}s", timeout.as_secs());
     }
 
     // -----------------------------------------------------------------------
