@@ -106,9 +106,6 @@ func main() {
 	println("start")
 	led := machine.LED
 	led.Configure(machine.PinConfig{Mode: machine.PinOutput})
-	led.Low()
-	time.Sleep(time.Second * 5)
-	led.High()
 	machine.InitADC()
 	ADCBattery := machine.ADC{machine.P0_31}
 	ADCBattery.Configure(machine.ADCConfig{})
@@ -132,7 +129,9 @@ func main() {
 	println("Go Bluetooth /", address.MAC.String())
 
 	for {
+		led.Low()
 		handleESPSession()
+		led.High()
 
 		// Then wait until next session
 		nextESPWakeup := time.Now().Add(ESP_SLEEP_TIME)
