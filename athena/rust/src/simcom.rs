@@ -847,7 +847,7 @@ impl<'a, P1: OutputPin, P2: OutputPin> SimcomModule<'a, P1, P2> {
         url: &str,
         headers: &[(&str, &str)],
         body: Option<&[u8]>,
-    ) -> Result<String> {
+    ) -> Result<HttpResponse> {
         let url = url.strip_prefix("http://").unwrap_or(url);
         let (host, path) = if let Some(slash_pos) = url.find('/') {
             (&url[..slash_pos], &url[slash_pos..])
@@ -931,26 +931,25 @@ impl<'a, P1: OutputPin, P2: OutputPin> SimcomModule<'a, P1, P2> {
 
         let response_str = String::from_utf8_lossy(&response);
         info!("HTTP response received ({} bytes)", response.len());
-        Ok(response_str.to_string())
+        Ok(parse_http_response(&response_str))
     }
 
-    pub fn http_post(&mut self, url: &str, body: &[u8], headers: &[(&str, &str)]) -> Result<()> {
+    pub fn http_post(&mut self, url: &str, body: &[u8], headers: &[(&str, &str)]) -> Result<HttpResponse> {
         info!("Sending data via HTTP ({} bytes)...", body.len());
 
-        let response = match self.send_http_request("POST", url, headers, Some(body)) {
-            Ok(r) => r,
-            Err(err) => bail!("HTTP POST failed with error: {}", err),
-        };
+        let response = self
+            .send_http_request("POST", url, headers, Some(body))
+            .map_err(|e| anyhow::anyhow!("HTTP POST failed: {}", e))?;
 
-        if response.contains("HTTP/1.1 2") || response.contains("HTTP/1.0 2") {
+        if response.status >= 200 && response.status < 400 {
             info!("HTTP POST successful");
-            Ok(())
         } else {
-            bail!("HTTP POST failed with response: {}", response)
+            bail!("HTTP POST failed with response: {:?}", response.body)
         }
+        Ok(response)
     }
 
-    pub fn http_get(&mut self, url: &str, headers: &[(&str, &str)]) -> Result<String> {
+    pub fn http_get(&mut self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse> {
         info!("Sending HTTP GET to {}", url);
         self.send_http_request("GET", url, headers, None)
     }
@@ -963,3 +962,31 @@ impl<'a, P1: OutputPin, P2: OutputPin> SimcomModule<'a, P1, P2> {
         self.is_connected
     }
 }
+
+
+use crate::modem::{Modem, HttpResponse, parse_http_response};
+
+impl<'a, P1: OutputPin, P2: OutputPin> Modem for SimcomModule<'a, P1, P2> {
+    fn initialize_network(&mut self, apn: &str) -> Result<()> {
+        self.initialize_network(apn)
+    }
+    fn http_post(&mut self, url: &str, body: &[u8], headers: &[(&str, &str)]) -> Result<HttpResponse> {
+        self.http_post(url, body, headers)
+    }
+    fn http_get(&mut self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse> {
+        self.http_get(url, headers)
+    }
+    fn battery_voltage(&mut self) -> Result<f32> {
+        self.battery_voltage()
+    }
+    fn sleep(&mut self) -> Result<()> {
+        self.sleep()
+    }
+    fn wake(&mut self) -> Result<()> {
+        self.wake()
+    }
+    fn is_connected(&self) -> bool {
+        self.is_connected()
+    }
+}
+

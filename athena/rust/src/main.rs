@@ -6,11 +6,7 @@ use esp_idf_hal::{
 };
 use esp_idf_sys::{self as _, *};
 use esp_camera_rs::Camera;
-use esp_idf_svc::{
-    http::client::{Configuration, EspHttpConnection},
-    eventloop::EspSystemEventLoop,
-};
-use embedded_svc::http::client::{Client, Method};
+use esp_idf_svc::eventloop::EspSystemEventLoop;
 
 use esp_idf_hal::i2c::{self, I2cDriver};
 
@@ -18,21 +14,43 @@ use log::*;
 use std::time::Duration;
 use std::thread;
 
-mod dcim;
-mod quectel;
-mod simcom;
+#[cfg(feature = "modem-wifi")]
 mod wifi;
 
-use dcim::{SDSPIHost, DCIM};
-use quectel::QuectelModule;
-use simcom::SimcomModule;
+#[cfg(feature = "modem-wifi")]
 use wifi::wifi;
+
+mod dcim;
+mod board;
+
+mod simcom;
+mod quectel;
+mod modem;
+
+mod ota;
+
+#[cfg(feature = "modem-simcom")]
+use simcom::SimcomModule as Modem;
+
+#[cfg(feature = "modem-quectel")]
+use quectel::QuectelModule as Modem;
+
+#[cfg(feature = "modem-wifi")]
+use wifi::WifiModem;
+
+use dcim::{SDSPIHost, DCIM};
 
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 use std::sync::Arc;
 use core::ffi::c_void;
 
 use ina3221::{INA3221, OperatingMode, Voltage};
+
+const FIRMWARE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION_MAJOR"), ".", env!("CARGO_PKG_VERSION_MINOR"));
+
+#[used]
+#[no_mangle]
+static FIRMWARE_VERSION_TAG: &[u8] = concat!("ATHENA_FIRMWARE_VERSION:", env!("CARGO_PKG_VERSION_MAJOR"), ".", env!("CARGO_PKG_VERSION_MINOR"), "\0").as_bytes();
 
 // ESP32 sleeping time between pictures (should actually be powered down by the nRF)
 const SLEEP_MINUTES: u64 = 30;
@@ -135,6 +153,8 @@ fn main() {
     esp_idf_sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
+    info!("Athena booting up with version {}", FIRMWARE_VERSION);
+
     let shared_box = Arc::new(PowerData::default());
     let shared_bool_task_running = Arc::new(AtomicBool::new(true));
 
@@ -147,7 +167,7 @@ fn main() {
         }
     };
 
-    let mut led_pin = match PinDriver::output(peripherals.pins.gpio21) {
+    let mut led_pin = match PinDriver::output(board::pin(board::pins::LED)) {
         Ok(led_pin) => Some(led_pin),
         Err(_) => None,
     };
@@ -158,14 +178,14 @@ fn main() {
 
     if let Ok(i2c) = i2c::I2cDriver::new(
         peripherals.i2c0,
-        peripherals.pins.gpio5,
-        peripherals.pins.gpio6,
+        board::pin(board::pins::I2C_SDA),
+        board::pin(board::pins::I2C_SCL),
         &i2c::I2cConfig::new().baudrate(Hertz(400_000)),
     ) {
         spawn_ina3221_monitoring_task(INA3221::new(i2c, INA3221_I2C_ADDR), shared_box.clone(), shared_bool_task_running.clone());
     }
 
-    let _ = match EspSystemEventLoop::take() {
+    let sysloop = match EspSystemEventLoop::take() {
         Ok(sysloop) => sysloop,
         Err(e) => {
             println!("Failed to take ESP event loop: {:?}, retrying in 1 second...", e);
@@ -174,22 +194,39 @@ fn main() {
         }
     };
 
-    let mut gsm_module = match UartDriver::new(
+    #[cfg(feature = "modem-wifi")]
+    let mut gsm_module: Option<Box<dyn modem::Modem>> = {
+        const WIFI_SSID: &str = env!("WIFI_SSID");
+        const WIFI_PASS: &str = env!("WIFI_PASS");
+        match wifi::wifi(WIFI_SSID, WIFI_PASS, peripherals.modem, sysloop) {
+            Ok(wifi) => {
+                info!("WiFi connected, using WifiModem");
+                Some(Box::new(WifiModem::new(wifi)))
+            }
+            Err(e) => {
+                info!("WiFi connection failed: {:?}, continuing without network", e);
+                None
+            }
+        }
+    };
+
+    #[cfg(not(feature = "modem-wifi"))]
+    let mut gsm_module: Option<Box<dyn modem::Modem>> = match UartDriver::new(
         peripherals.uart1,
-        peripherals.pins.gpio2, // D1
-        peripherals.pins.gpio4, // D3
+        board::pin(board::pins::GSM_TX),
+        board::pin(board::pins::GSM_RX),
         Option::<esp_idf_hal::gpio::AnyIOPin>::None,
         Option::<esp_idf_hal::gpio::AnyIOPin>::None,
         &UartConfig::new().baudrate(esp_idf_hal::units::Hertz(115200)),
     ) {
         Ok(uart) => {
-            let sleep_pin = match PinDriver::output(peripherals.pins.gpio9) {
+            let sleep_pin = match PinDriver::output(board::pin(board::pins::GSM_SLP)) {
                 Ok(sleep_pin) => Some(sleep_pin),
                 Err(_) => None,
             };
 
-            match PinDriver::output(peripherals.pins.gpio3) { // D2
-                Ok(power_pin) => Some(SimcomModule::new(uart, power_pin, sleep_pin)),
+            match PinDriver::output(board::pin(board::pins::GSM_PWR)) {
+                Ok(power_pin) => Some(Box::new(Modem::new(uart, power_pin, sleep_pin))),
                 Err(e) => {
                     println!("Failed to initialize 4G module power pin: {:?}, continuing without 4G", e);
                     None
@@ -203,20 +240,20 @@ fn main() {
     };
 
     let camera = match Camera::new(
-        peripherals.pins.gpio10,
-        peripherals.pins.gpio40,
-        peripherals.pins.gpio39,
-        peripherals.pins.gpio15,
-        peripherals.pins.gpio17,
-        peripherals.pins.gpio18,
-        peripherals.pins.gpio16,
-        peripherals.pins.gpio14,
-        peripherals.pins.gpio12,
-        peripherals.pins.gpio11,
-        peripherals.pins.gpio48,
-        peripherals.pins.gpio38,
-        peripherals.pins.gpio47,
-        peripherals.pins.gpio13,
+        board::pin(board::pins::CAM_XCLK),
+        board::pin(board::pins::CAM_SDA),
+        board::pin(board::pins::CAM_SCL),
+        board::pin(board::pins::CAM_D0),
+        board::pin(board::pins::CAM_D1),
+        board::pin(board::pins::CAM_D2),
+        board::pin(board::pins::CAM_D3),
+        board::pin(board::pins::CAM_D4),
+        board::pin(board::pins::CAM_D5),
+        board::pin(board::pins::CAM_D6),
+        board::pin(board::pins::CAM_D7),
+        board::pin(board::pins::CAM_VSYNC),
+        board::pin(board::pins::CAM_HREF),
+        board::pin(board::pins::CAM_PCLK),
         10_000_000, // ~8 MHz to ~20 MHz
         19,   // 4 (best) to 19 (worst)
         2,
@@ -232,25 +269,6 @@ fn main() {
             None
         },
     };
-
-    let wifi: Option<bool> = None;
-    /*
-    let wifi = match wifi(
-        "Arctica",
-        "1407178914071789",
-        peripherals.modem,
-        sysloop
-    ) {
-        Ok(wifi) => {
-            println!("WiFi connected");
-            Some(wifi)
-        },
-        Err(e) => {
-            println!("Failed to initialize WiFi: {:?}, doing without", e);
-            None
-        },
-    };
-        */
 
     let mac_string = unsafe {
         let mut base_mac = [0u8; 6];
@@ -288,44 +306,6 @@ fn main() {
                         }
                     }
 
-                    let content_length = format!("{}", image_data.len());
-                    let headers = [
-                        ("Content-Type", "image/jpeg"),
-                        ("Content-Length", content_length.as_str()),
-                        ("X-Board-Id", mac_string.as_str()),
-                    ];
-
-                    if wifi.is_some() {
-                        match EspHttpConnection::new(&Configuration::default()) {
-                            Ok(connection) => {
-                                let mut client = Client::wrap(connection);
-                                match client.request(Method::Post,PHOTO_URL.as_ref(), &headers) {
-                                    Ok(mut request) => {
-                                        if let Err(e) = request.write(image_data) {
-                                            info!("Could not send image data though POST request: {:?}", e);
-                                        }
-                                        let _ = request.flush();
-                                        match request.submit() {
-                                            Ok(response) => {
-                                                let status = response.status();
-                                                info!("Response status: {:?}", status);
-                                            },
-                                            Err(e) => {
-                                                info!("HTTP request error: {:?}", e);
-                                            },
-                                        }
-                                    },
-                                    Err(e) => {
-                                        info!("Cannot create HTTP request: {:?}", e);
-                                    }
-                                }
-                            },
-                            Err(e) => {
-                                info!("Cannot create HTTP connection: {:?}", e);
-                            }
-                        }
-                    }
-
                     if let Some(ref mut gsm_module) = gsm_module {
                         //if let Err(e) = gsm_module.wake() {
                         //    info!("Could not power on 4G module: {:?} (but maybe it's already powered on)", e);
@@ -347,6 +327,7 @@ fn main() {
                         let headers = [
                             ("Content-Type", "application/json"),
                             ("X-Board-Id", mac_string.as_str()),
+                            ("X-Firmware-Version", FIRMWARE_VERSION),
                         ];
 
                         let json_data = format!("{{ \"{}\": {}, \"{}\": {}, \"{}\": {}, \"{}\": {}, \"{}\": {}, \"{}\": {}, \"{}\": {}, \"{}\": {} }}",
@@ -362,16 +343,44 @@ fn main() {
 
                         info!("CPU0 power data: {:?}", shared_box);
 
-                        if let Err(e) = gsm_module.http_post(
-                            SENSOR_DATA_URL,
-                            json_data.as_bytes(),
-                            &headers) {
-                            info!("Could not send data through 4G module: {:?}", e);
+                        match gsm_module.http_post(SENSOR_DATA_URL, json_data.as_bytes(), &headers) {
+                            Ok(response) => {
+                                if let (Some(fw_url), Some(fw_sha256), Some(fw_version)) = (
+                                    response.header("X-Firmware-Update"),
+                                    response.header("X-Firmware-SHA256"),
+                                    response.header("X-Firmware-Version"),
+                                ) {
+                                    let parsed_version_update = fw_version.parse::<f32>().unwrap_or(0.0);
+                                    let parsed_version_current = FIRMWARE_VERSION.parse::<f32>().unwrap_or(0.0);
+
+                                    info!("OTA update signalled, firmware version {} (parsed: {}) at '{}'", fw_version, parsed_version_update, fw_url);
+
+                                    if parsed_version_update > parsed_version_current {
+                                        info!("Update is newer than our version ({}), performing OTA update", parsed_version_current);
+                                        let headers = [
+                                            ("X-Board-Id", mac_string.as_str()),
+                                            ("X-Firmware-Version", FIRMWARE_VERSION),
+                                        ];
+                                        match gsm_module.http_get(&fw_url, &headers) {
+                                            Ok(fw_response) => {
+                                                if let Err(e) = ota::install_firmware(&fw_response.body, &fw_sha256) {
+                                                    info!("OTA failed: {:?}", e);
+                                                }
+                                            }
+                                            Err(e) => info!("OTA download failed: {:?}", e),
+                                        }
+                                    } else {
+                                        info!("Update is not newer than our version ({}), no need to update", parsed_version_current);
+                                    }
+                                }
+                            }
+                            Err(e) => info!("Could not send data through 4G module: {:?}", e),
                         }
 
                         let headers = [
                             ("Content-Type", "image/jpeg"),
                             ("X-Board-Id", mac_string.as_str()),
+                            ("X-Firmware-Version", FIRMWARE_VERSION),
                         ];
 
                         if let Err(e) = gsm_module.http_post(PHOTO_URL, image_data, &headers) {
@@ -381,6 +390,7 @@ fn main() {
                         let headers = [
                             ("Content-Type", "application/json"),
                             ("X-Board-Id", mac_string.as_str()),
+                            ("X-Firmware-Version", FIRMWARE_VERSION),
                         ];
 
                         let json_data = format!("{{ \"{}\": {}, \"{}\": {} }}",

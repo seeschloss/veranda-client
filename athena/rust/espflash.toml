@@ -7,3 +7,4 @@ partition_table = "partitions.csv"
 mode = "dio"
 size = "8MB"
 frequency = "40MHz"
+baud = 921600

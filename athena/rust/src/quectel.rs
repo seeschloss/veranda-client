@@ -127,6 +127,9 @@ impl<'a, P1: OutputPin, P2: OutputPin> QuectelModule<'a, P1, P2> {
             };
 
             retries -= 1;
+            if retries > 0 {
+                thread::sleep(Duration::from_secs(1));
+            }
         }
 
         result
@@ -270,19 +273,28 @@ impl<'a, P1: OutputPin, P2: OutputPin> QuectelModule<'a, P1, P2> {
     }
 
     pub fn battery_voltage(&mut self) -> Result<f32> {
-        match self.send_at_command("AT+CBC", "OK", Duration::from_secs(30)) {
-            Ok(str_raw_response) => match str_raw_response.split_whitespace().nth(1) {
-                Some(str_response_data) => match str_response_data.split(",").nth(2) {
-                    Some(str_voltage_field) => match str_voltage_field.parse::<f32>() {
-                        Ok(voltage_float) => Ok(voltage_float / 1000.0),
-                        Err(e) => Err(anyhow!("Failed to parse CBC voltage: {}", e)),
-                    },
-                    None => Err(anyhow!("No voltage field in response"))
-                },
-                None => Err(anyhow!("Couldn't find response field"))
-            },
-            Err(e) => Err(anyhow!("AT+CBC command failure: {}", e)),
+        let response = self.send_at_command("AT+CBC", "OK", Duration::from_secs(30))
+            .map_err(|e| anyhow!("AT+CBC command failure: {}", e))?;
+
+        // Find "+CBC:" as a substring rather than relying on token position.
+        // The BG95/EC200A format is: +CBC: <bcs>,<bcl>,<mV>
+        // Using nth(1) on split_whitespace() was fragile: any leading garbage
+        // byte shifted all tokens and caused a silent parse failure.
+        if let Some(pos) = response.find("+CBC:") {
+            let after = response[pos + 5..].trim_start();
+            if let Some(mv_str) = after.split(',').nth(2) {
+                let mv_clean: String = mv_str.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if !mv_clean.is_empty() {
+                    return mv_clean.parse::<f32>()
+                        .map(|v| v / 1000.0)
+                        .map_err(|e| anyhow!("Failed to parse CBC voltage '{}': {}", mv_clean, e));
+                }
+            }
         }
+
+        Err(anyhow!("No +CBC: field in response: {}", response))
     }
 
     pub fn initialize_network(&mut self, apn: &str) -> Result<()> {
@@ -472,7 +484,7 @@ impl<'a, P1: OutputPin, P2: OutputPin> QuectelModule<'a, P1, P2> {
         "".as_bytes().to_vec()
     }
 
-    pub fn send_http_request(&mut self, method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8]>) -> Result<String> {
+    pub fn send_http_request(&mut self, method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8]>) -> Result<HttpResponse> {
         // Parse URL to extract host and path
         let url = url.strip_prefix("http://").unwrap_or(url);
         let (host, path) = if let Some(slash_pos) = url.find('/') {
@@ -557,31 +569,25 @@ impl<'a, P1: OutputPin, P2: OutputPin> QuectelModule<'a, P1, P2> {
         let response_str = String::from_utf8_lossy(&response);
         info!("HTTP response received ({} bytes)", response.len());
 
-        Ok(response_str.to_string())
+        Ok(parse_http_response(&response_str))
     }
 
-    pub fn http_post(&mut self, url: &str, body: &[u8], headers: &[(&str, &str)]) -> Result<()> {
+    pub fn http_post(&mut self, url: &str, body: &[u8], headers: &[(&str, &str)]) -> Result<HttpResponse> {
         info!("Sending data via HTTP ({} bytes)...", body.len());
 
-        let response = match self.send_http_request("POST", url, headers, Some(body)) {
-            Ok(response) => {
-                response
-            },
-            Err(err) => {
-                bail!("HTTP POST failed with error: {}", err);
-            },
-        };
+        let response = self
+            .send_http_request("POST", url, headers, Some(body))
+            .map_err(|e| anyhow::anyhow!("HTTP POST failed: {}", e))?;
 
-        // Check if response indicates success
-        if response.contains("HTTP/1.1 200") || response.contains("HTTP/1.0 200") {
+        if response.status >= 200 && response.status < 400 {
             info!("HTTP POST successful");
-            Ok(())
         } else {
-            bail!("HTTP POST failed with response: {}", response);
+            bail!("HTTP POST failed with response: {:?}", response.body);
         }
+        Ok(response)
     }
 
-    pub fn http_get(&mut self, url: &str, headers: &[(&str, &str)]) -> Result<String> {
+    pub fn http_get(&mut self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse> {
         info!("Sending HTTP GET to {}", url);
         self.send_http_request("GET", url, headers, None)
     }
@@ -590,3 +596,30 @@ impl<'a, P1: OutputPin, P2: OutputPin> QuectelModule<'a, P1, P2> {
         self.is_connected
     }
 }
+
+use crate::modem::{Modem, HttpResponse, parse_http_response};
+
+impl<'a, P1: OutputPin, P2: OutputPin> Modem for QuectelModule<'a, P1, P2> {
+    fn initialize_network(&mut self, apn: &str) -> Result<()> {
+        self.initialize_network(apn)
+    }
+    fn http_post(&mut self, url: &str, body: &[u8], headers: &[(&str, &str)]) -> Result<HttpResponse> {
+        self.http_post(url, body, headers)
+    }
+    fn http_get(&mut self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse> {
+        self.http_get(url, headers)
+    }
+    fn battery_voltage(&mut self) -> Result<f32> {
+        self.battery_voltage()
+    }
+    fn sleep(&mut self) -> Result<()> {
+        self.sleep()
+    }
+    fn wake(&mut self) -> Result<()> {
+        self.wake()
+    }
+    fn is_connected(&self) -> bool {
+        self.is_connected()
+    }
+}
+
