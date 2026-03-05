@@ -9,13 +9,11 @@ import (
 )
 
 const NRF_SLEEP_TIME = 30 * time.Second
-//const ESP_SLEEP_TIME = 2 * 30 * time.Second
 const ESP_SLEEP_TIME = 60 * 30 * time.Second
 const ESP_TIMEOUT = 160 * time.Second
 
 var (
 	adapter = bluetooth.DefaultAdapter
-	battery bluetooth.Characteristic
 
 	batteryLevel [2]byte
 	supplyLevel [2]byte
@@ -30,52 +28,50 @@ var (
 	}
 )
 
-type device struct {
-}
-
 func waitForInterrupt(pin machine.Pin, lowDuration time.Duration, timeout time.Duration) bool {
     fallingEdge := false
 
     pin.SetInterrupt(machine.PinFalling, func(p machine.Pin) {
-		println("Falling edge")
+        println("Falling edge")
         fallingEdge = true
     })
 
     deadline := time.Now().Add(timeout)
 
     for time.Now().Before(deadline) {
-		println("Falling edge?", fallingEdge)
+        println("Falling edge?", fallingEdge)
         if fallingEdge {
             fallingEdge = false
             time.Sleep(10 * time.Millisecond)
 
             if !pin.Get() {
                 start := time.Now()
-				valid := true
+                valid := true
 
                 for time.Since(start) < lowDuration {
                     if pin.Get() {
-						valid = false
-						println("Pin went high again")
-						break
+                        valid = false
+                        println("Pin went high again")
+                        break
                     }
                     time.Sleep(10 * time.Millisecond)
                 }
 
-				if valid {
-					// Pin stayed low for entire duration
-					//return true
-				}
+                if valid {
+                    // Pin stayed low for entire duration
+                    //return true
+                }
             }
         }
 
-		// Up to 5 seconds delay before reacting is fine
+        // Up to 5 seconds delay before reacting is fine
         time.Sleep(5 * time.Second)
     }
 
     // Timeout
     return false
 }
+
 func handleESPSession() bool {
 	pin_power := machine.P0_08
 	pin_power.Configure(machine.PinConfig{Mode: machine.PinOutput})
@@ -85,6 +81,9 @@ func handleESPSession() bool {
 
 	pin_sleep_signal := machine.P0_29
 	pin_sleep_signal.Configure(machine.PinConfig{Mode: machine.PinInput})
+
+	// Release I2C pins before powering the ESP so it owns the bus cleanly.
+	ina3221Release()
 
 	pin_power.High()
 	pin_3v3.High()
@@ -104,37 +103,25 @@ func handleESPSession() bool {
 	pin_3v3.Low()
 	pin_power.Low()
 
+	// Re-claim the I2C bus now that the ESP is off.
+	ina3221Init()
+
 	return true
 }
 
 func main() {
 	println("start")
+
 	led := machine.LED
 	led.Configure(machine.PinConfig{Mode: machine.PinOutput})
-	led.Low()
-	time.Sleep(time.Second * 5)
-	led.High()
-	machine.InitADC()
-	ADCBattery := machine.ADC{machine.P0_31}
-	ADCBattery.Configure(machine.ADCConfig{})
 
-	ADCSupply := machine.ADC{machine.P0_04}
-	ADCSupply.Configure(machine.ADCConfig{})
+	// Bring up I2C and the INA3221.
+	ina3221Init()
 
-	pin_ina_scl := machine.P0_17
-	pin_ina_sda := machine.P0_20
-
-	pin_ina_scl.Configure(machine.PinConfig{Mode: machine.PinOutput})
-	pin_ina_sda.Configure(machine.PinConfig{Mode: machine.PinOutput})
-
-	pin_ina_scl.Low()
-	pin_ina_sda.Low()
-
-	voltage_battery := uint16(float32(ADCBattery.Get()) / 65535 * 4.2 * 1000)
-	voltage_supply := uint16(float32(ADCSupply.Get()) / 65535 * 4.2 * 1000)
-	println("Battery: ", voltage_battery, " mV")
-	println("PSU: ", voltage_supply, " mV")
-	// 2^16 / 3.3 / 2
+	voltage_battery, voltage_supply, voltage_charge := readVoltages()
+	println("Battery:", voltage_battery, "mV")
+	println("PSU:    ", voltage_supply, "mV")
+	println("Charge: ", voltage_charge, "mV")
 
 	must("enable BLE stack", adapter.Enable())
 	adv := adapter.DefaultAdvertisement()
@@ -146,18 +133,20 @@ func main() {
 	println("Go Bluetooth /", address.MAC.String())
 
 	for {
+		led.High()
 		handleESPSession()
+		led.Low()
 
-		// Then wait until next session
 		nextESPWakeup := time.Now().Add(ESP_SLEEP_TIME)
-		for (nextESPWakeup.Compare(time.Now()) > 0) {
-			voltage_battery = uint16(float32(ADCBattery.Get()) / 65535 * 4.2 * 1000)
-			voltage_supply = uint16(float32(ADCSupply.Get()) / 65535 * 4.2 * 1000)
+		for nextESPWakeup.Compare(time.Now()) > 0 {
+			voltage_battery, voltage_supply, voltage_charge = readVoltages()
 			binary.LittleEndian.PutUint16(batteryLevel[:], voltage_battery)
 			binary.LittleEndian.PutUint16(supplyLevel[:], voltage_supply)
+			binary.LittleEndian.PutUint16(supplyLevel[:], voltage_charge)
 
-			println("Battery: ", voltage_battery, " mV")
-			println("PSU: ", voltage_supply, " mV")
+			println("Battery:", voltage_battery, "mV")
+			println("PSU:    ", voltage_supply, "mV")
+			println("Charge: ", voltage_charge, "mV")
 
 			println("Sleeping for", NRF_SLEEP_TIME)
 			adv.Configure(advertisement_options)
