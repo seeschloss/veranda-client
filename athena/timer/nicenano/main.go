@@ -29,47 +29,47 @@ var (
 )
 
 func waitForInterrupt(pin machine.Pin, lowDuration time.Duration, timeout time.Duration) bool {
-    fallingEdge := false
+	fallingEdge := false
 
-    pin.SetInterrupt(machine.PinFalling, func(p machine.Pin) {
-        println("Falling edge")
-        fallingEdge = true
-    })
+	pin.SetInterrupt(machine.PinFalling, func(p machine.Pin) {
+		println("Falling edge")
+		fallingEdge = true
+	})
 
-    deadline := time.Now().Add(timeout)
+	deadline := time.Now().Add(timeout)
 
-    for time.Now().Before(deadline) {
-        println("Falling edge?", fallingEdge)
-        if fallingEdge {
-            fallingEdge = false
-            time.Sleep(10 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		println("Falling edge?", fallingEdge)
+		if fallingEdge {
+			fallingEdge = false
+			time.Sleep(10 * time.Millisecond)
 
-            if !pin.Get() {
-                start := time.Now()
-                valid := true
+			if !pin.Get() {
+				start := time.Now()
+				valid := true
 
-                for time.Since(start) < lowDuration {
-                    if pin.Get() {
-                        valid = false
-                        println("Pin went high again")
-                        break
-                    }
-                    time.Sleep(10 * time.Millisecond)
-                }
+				for time.Since(start) < lowDuration {
+					if pin.Get() {
+						valid = false
+						println("Pin went high again")
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
 
-                if valid {
-                    // Pin stayed low for entire duration
-                    //return true
-                }
-            }
-        }
+				if valid {
+					// Pin stayed low for entire duration
+					//return true
+				}
+			}
+		}
 
-        // Up to 5 seconds delay before reacting is fine
-        time.Sleep(5 * time.Second)
-    }
+		// Up to 5 seconds delay before reacting is fine
+		time.Sleep(5 * time.Second)
+	}
 
-    // Timeout
-    return false
+	// Timeout
+	return false
 }
 
 func handleESPSession() bool {
