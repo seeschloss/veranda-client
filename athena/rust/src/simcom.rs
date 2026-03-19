@@ -52,18 +52,18 @@ impl std::error::Error for SimcomError {
 ///
 /// This struct is a drop-in replacement for `QuectelModule` – it exposes the
 /// same public methods with identical signatures.
-pub struct SimcomModule<'a, P1: OutputPin, P2: OutputPin> {
+pub struct SimcomModule<'a> {
     uart: UartDriver<'a>,
-    power_pin: PinDriver<'a, P1, Output>,
-    sleep_pin: Option<PinDriver<'a, P2, Output>>,
+    power_pin: PinDriver<'a, Output>,
+    sleep_pin: Option<PinDriver<'a, Output>>,
     is_connected: bool,
 }
 
-impl<'a, P1: OutputPin, P2: OutputPin> SimcomModule<'a, P1, P2> {
+impl<'a> SimcomModule<'a> {
     pub fn new(
         uart: UartDriver<'a>,
-        power_pin: PinDriver<'a, P1, Output>,
-        sleep_pin: Option<PinDriver<'a, P2, Output>>,
+        power_pin: PinDriver<'a, Output>,
+        sleep_pin: Option<PinDriver<'a, Output>>,
     ) -> Self {
         Self {
             uart,
@@ -420,6 +420,8 @@ impl<'a, P1: OutputPin, P2: OutputPin> SimcomModule<'a, P1, P2> {
     ///   3. Open the network service with `AT+NETOPEN` (replaces Quectel's
     ///      implicit activation via `AT+QIACT`)
     pub fn initialize_network(&mut self, apn: &str) -> Result<()> {
+        self.detect_and_set_uart_speed(Hertz(460800))?;
+
         info!("Initializing network connection...");
 
         // ── 1. Confirm the modem is talking to us ───────────────────────────
@@ -710,130 +712,94 @@ impl<'a, P1: OutputPin, P2: OutputPin> SimcomModule<'a, P1, P2> {
         }
     }
 
-    /// Read pending data from a TCP socket.
+    /// Receive TCP data from `socket_id`, reading until the modem reports
+    /// `pending=0` (no more data buffered).
     ///
-    /// SIMCom A7670 delivers incoming data using manual-receive mode:
-    ///   - First call `AT+CIPRXGET=1,<socket>` to enable manual mode and
-    ///     query available data.
-    ///   - Then call `AT+CIPRXGET=2,<socket>,<len>` to fetch chunks of data.
-    ///   - Repeat until all pending data is retrieved (pending_len reaches 0).
-    ///
-    /// Response format:
-    ///   `+CIPRXGET: 1,<socket>,<pending_len>` (from AT+CIPRXGET=1)
-    ///   `+CIPRXGET: 2,<socket>,<actual_len>,<pending_len>\r\n<data>` (from AT+CIPRXGET=2)
-    pub fn receive_tcp_data(&mut self, socket_id: u8, max_len: usize) -> Vec<u8> {
+    /// `chunk_size` controls how many bytes are requested per `AT+CIPRXGET=2`
+    /// call. `already_received` allows the caller to seed the buffer with bytes
+    /// that arrived early (e.g. mixed in with a URC).
+    pub fn receive_tcp_data(&mut self, socket_id: u8, chunk_size: usize, already_received: &[u8]) -> Vec<u8> {
         let mut all_data: Vec<u8> = Vec::new();
+        all_data.extend_from_slice(already_received);
 
-        // Step 1: Query available data with AT+CIPRXGET=1
-        let query_cmd = format!("AT+CIPRXGET=1,{}", socket_id);
-        match self.send_at_command_silent(&query_cmd, "+CIPRXGET: 1", Duration::from_secs(10)) {
-            Ok(response) => {
-                info!("CIPRXGET=1 response: {}", response);
-            }
-            Err(e) => {
-                info!("CIPRXGET=1 query failed: {}", e);
-                return all_data;
-            }
-        }
+        let start   = std::time::Instant::now();
+        let timeout = Duration::from_secs(120);
+        let chunk   = chunk_size.min(4096);
+        let mut buf = [0u8; 4096];
 
-        // Step 2: Fetch data in chunks using AT+CIPRXGET=2 until no more pending
         loop {
-            let recv_cmd = format!("AT+CIPRXGET=2,{},{}", socket_id, max_len);
-            
-            // Send command and get the header
-            info!("Sending: {}", recv_cmd);
-            self.uart.write(format!("{}\r\n", recv_cmd).as_bytes()).ok();
-            
-            // Read response header and extract actual_len and pending_len
-            match self.wait_for_response("+CIPRXGET: 2", Duration::from_secs(10), false) {
+            if start.elapsed() > timeout {
+                info!("receive_tcp_data: timeout after {} bytes", all_data.len());
+                break;
+            }
+
+            let recv_cmd = format!("AT+CIPRXGET=2,{},{}", socket_id, chunk);
+            info!("Requesting {} bytes, {} received so far", chunk, all_data.len());
+            self.uart.write(format!("{}
+", recv_cmd).as_bytes()).ok();
+
+            // Wait for the reply to *our* command specifically.
+            // The response buffer may also contain "+CIPRXGET: 1,..." URCs —
+            // searching for "+CIPRXGET: 2," skips them unambiguously.
+            match self.wait_for_response("+CIPRXGET: 2,", Duration::from_secs(10), false) {
                 Ok(response) => {
-                    info!("Got response, length: {} chars", response.len());
-                    
-                    // Parse response header: +CIPRXGET: 2,<socket>,<actual_len>,<pending_len>\r\n
-                    let actual_len: usize;
-                    let pending_len: usize;
-                    
-                    if let Some(header_start) = response.find("+CIPRXGET:") {
-                        let after_header = &response[header_start..];
-                        if let Some(newline_pos) = after_header.find("\r\n") {
-                            let header_line = &after_header[..newline_pos];
-                            info!("Parsed header: '{}'", header_line);
-                            let fields: Vec<&str> = header_line.split(',').collect();
-                            
+                    if let Some(header_start) = response.find("+CIPRXGET: 2,") {
+                        let after = &response[header_start..];
+                        if let Some(nl) = after.find("
+") {
+                            // Header line: "+CIPRXGET: 2,<socket>,<actual>,<pending>"
+                            let fields: Vec<&str> = after[..nl].split(',').collect();
                             if fields.len() >= 4 {
-                                actual_len = fields[2].trim().parse::<usize>().unwrap_or(0);
-                                pending_len = fields[3].trim().parse::<usize>().unwrap_or(0);
-                                
-                                info!("CIPRXGET: actual={}, pending={}", actual_len, pending_len);
-                                
-                                // Now we know how much data to expect, read it all
-                                if actual_len > 0 {
-                                    // The data starts after \r\n following the header
-                                    let data_start_in_response = header_start + newline_pos + 2;
-                                    let mut data_buffer = Vec::new();
-                                    
-                                    info!("Response length: {}, data starts at position {}", response.len(), data_start_in_response);
-                                    
-                                    // Capture any data already in the response string after the header
-                                    if response.len() > data_start_in_response {
-                                        let remainder = &response[data_start_in_response..];
-                                        data_buffer.extend_from_slice(remainder.as_bytes());
-                                        info!("Got {} bytes from response string", data_buffer.len());
-                                    } else {
-                                        info!("No data in response string at position {}", data_start_in_response);
+                                let actual_len  = fields[2].trim().parse::<usize>().unwrap_or(0);
+                                let pending_len = fields[3].trim().parse::<usize>().unwrap_or(0);
+
+                                if actual_len == 0 {
+                                    if pending_len == 0 {
+                                        break; // all data consumed
                                     }
-                                    
-                                    // If we need more data, read from UART until we have all actual_len bytes
-                                    if data_buffer.len() < actual_len {
-                                        info!("Need {} more bytes from UART", actual_len - data_buffer.len());
-                                        let mut buf = [0u8; 1024];
-                                        let start = std::time::Instant::now();
-                                        
-                                        while data_buffer.len() < actual_len && start.elapsed() < Duration::from_secs(10) {
-                                            match self.uart.read(&mut buf, 100) {
-                                                Ok(len) if len > 0 => {
-                                                    let bytes_needed = actual_len - data_buffer.len();
-                                                    let bytes_to_take = bytes_needed.min(len);
-                                                    data_buffer.extend_from_slice(&buf[..bytes_to_take]);
-                                                    info!("Read {} bytes, total now: {}/{}", 
-                                                        bytes_to_take, data_buffer.len(), actual_len);
-                                                }
-                                                _ => thread::sleep(Duration::from_millis(10)),
-                                            }
+                                    thread::sleep(Duration::from_millis(50));
+                                    continue;
+                                }
+
+                                // Bytes that arrived in the same UART read as the header.
+                                let data_start = header_start + nl + 2;
+                                let prefetched = if response.len() > data_start {
+                                    let bytes = &response.as_bytes()[data_start..];
+                                    all_data.extend_from_slice(bytes);
+                                    bytes.len()
+                                } else {
+                                    0
+                                };
+
+                                // Drain the remainder directly from UART.
+                                let mut need = actual_len.saturating_sub(prefetched);
+                                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                                while need > 0 && std::time::Instant::now() < deadline {
+                                    let to_read = need.min(buf.len());
+                                    match self.uart.read(&mut buf[..to_read], 10) {
+                                        Ok(n) if n > 0 => {
+                                            all_data.extend_from_slice(&buf[..n]);
+                                            need = need.saturating_sub(n);
                                         }
+                                        _ => thread::sleep(Duration::from_millis(5)),
                                     }
-                                    
-                                    info!("Captured {} bytes of data total", data_buffer.len());
-                                    
-                                    // Truncate to exactly actual_len if we somehow got more
-                                    if data_buffer.len() > actual_len {
-                                        data_buffer.truncate(actual_len);
-                                    }
-                                    
-                                    all_data.extend_from_slice(&data_buffer);
                                 }
-                                
-                                // If no more data pending, we're done
+
                                 if pending_len == 0 {
-                                    break;
+                                    break; // modem buffer empty, we are done
                                 }
-                            } else {
-                                info!("Unexpected header format: {}", header_line);
-                                break;
                             }
                         }
                     }
                 }
-                Err(e) => {
-                    info!("CIPRXGET=2 fetch failed: {}", e);
+                Err(_) => {
+                    // Timeout on this chunk — stop rather than spin.
                     break;
                 }
             }
-            
-            // Small delay between chunks
-            thread::sleep(Duration::from_millis(50));
         }
 
+        info!("receive_tcp_data: {} bytes total", all_data.len());
         all_data
     }
 
@@ -926,7 +892,29 @@ impl<'a, P1: OutputPin, P2: OutputPin> SimcomModule<'a, P1, P2> {
 
         thread::sleep(Duration::from_millis(500));
 
-        let response = self.receive_tcp_data(socket_id, 1024);
+        // Wait for the data-ready URC. This also consumes any +IPCLOSE that
+        // arrives alongside it, clearing the UART for the CIPRXGET=2 loop.
+        let early_data = match self.wait_for_response("+CIPRXGET: 1,", Duration::from_secs(10), false) {
+            Ok(urc) => {
+                // Extract any body bytes that arrived in the same UART read as the URC.
+                // Format: "...+CIPRXGET: 1,<socket>\r\n<possible early data>"
+                if let Some(pos) = urc.find("+CIPRXGET: 1,") {
+                    let after_urc = &urc[pos..];
+                    if let Some(nl) = after_urc.find("\r\n") {
+                        let tail = &after_urc[nl + 2..];
+                        tail.as_bytes().to_vec()
+                    } else {
+                        vec![]
+                    }
+                } else {
+                    vec![]
+                }
+            }
+            Err(_) => vec![],
+        };
+
+        let response = self.receive_tcp_data(socket_id, 4096, &early_data);
+
         let _ = self.close_tcp_connection(socket_id);
 
         let response_str = String::from_utf8_lossy(&response);
@@ -966,7 +954,7 @@ impl<'a, P1: OutputPin, P2: OutputPin> SimcomModule<'a, P1, P2> {
 
 use crate::modem::{Modem, HttpResponse, parse_http_response};
 
-impl<'a, P1: OutputPin, P2: OutputPin> Modem for SimcomModule<'a, P1, P2> {
+impl<'a> Modem for SimcomModule<'a> {
     fn initialize_network(&mut self, apn: &str) -> Result<()> {
         self.initialize_network(apn)
     }
@@ -989,4 +977,3 @@ impl<'a, P1: OutputPin, P2: OutputPin> Modem for SimcomModule<'a, P1, P2> {
         self.is_connected()
     }
 }
-

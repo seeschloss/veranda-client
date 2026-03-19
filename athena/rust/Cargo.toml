@@ -1,11 +1,11 @@
 [package]
 name = "athena"
-version = "2.4.0"
+version = "2.93.0"
 edition = "2021"
 resolver = "2"
 
 [dependencies]
-esp-idf-hal = "*"
+esp-idf-hal = "0.46"
 esp-idf-sys = { version = "*", features = ["binstart", "native"] }
 esp-idf-svc = "*"
 embedded-svc = "*"
@@ -13,7 +13,6 @@ embedded-hal = "*"
 anyhow = "*"
 log = "*"
 esp-camera-rs = { path = "esp-camera-rs" }
-#esp-camera-rs = { git = "https://github.com/hnz1102/esp-camera-rs" }
 
 heapless = "*"
 ina3221 = "0.4.5"
@@ -35,9 +34,7 @@ harness = false
 
 [package.metadata.esp-idf-sys]
 # This will automatically generate UF2 after build
-extra_components = [
-    { name = "esp_tinyuf2", git = "https://github.com/espressif/esp-iot-solution.git", path = "components/usb/esp_tinyuf2" }
-]
+esp_idf_version = "v5.5"
 
 
 #[env]
@@ -54,8 +51,10 @@ partition_table = "partitions.csv"
 
 [features]
 default = []
-board-xiao  = []
+
+board-xiao = []
 board-wroom = []
+
 modem-simcom = []
 modem-quectel = []
 modem-wifi = []

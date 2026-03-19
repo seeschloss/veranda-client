@@ -22,6 +22,9 @@ const INA3221_BUS_VOLTAGE_LSB_MV = 8
 // ina3221Init configures I2C0 on the INA pins and brings the chip up.
 // Call this before any reads, and after an ESP session ends.
 func ina3221Init() {
+	machine.P0_17.Configure(machine.PinConfig{Mode: machine.PinInputPullup})
+    machine.P0_20.Configure(machine.PinConfig{Mode: machine.PinInputPullup})
+
 	err := machine.I2C0.Configure(machine.I2CConfig{
 		SCL:       machine.P0_17,
 		SDA:       machine.P0_20,

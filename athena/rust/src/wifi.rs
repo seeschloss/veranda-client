@@ -2,7 +2,6 @@ use anyhow::{bail, Result};
 use embedded_svc::http::client::Client;
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
-    hal::peripheral,
     http::client::{Configuration as HttpConfig, EspHttpConnection},
     wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi},
 };
@@ -12,6 +11,10 @@ use std::io::Read;
 
 use crate::modem::{HttpResponse, Modem};
 
+#[used]
+#[no_mangle]
+static FIRMWARE_TARGET_MODEM: &[u8] = "ATHENA_TARGET_MODEM: wifi\0".as_bytes();
+
 // ---------------------------------------------------------------------------
 // WiFi connection helper (unchanged from original)
 // ---------------------------------------------------------------------------
@@ -19,7 +22,7 @@ use crate::modem::{HttpResponse, Modem};
 pub fn wifi(
     ssid: &str,
     pass: &str,
-    modem: impl peripheral::Peripheral<P = esp_idf_svc::hal::modem::Modem> + 'static,
+    modem: esp_idf_hal::modem::Modem<'static>,
     sysloop: EspSystemEventLoop,
 ) -> Result<Box<EspWifi<'static>>> {
     let mut auth_method = AuthMethod::WPA2Personal;
@@ -37,30 +40,16 @@ pub fn wifi(
     let mut wifi = BlockingWifi::wrap(&mut esp_wifi, sysloop)?;
 
     wifi.set_configuration(&Configuration::Client(ClientConfiguration::default()))?;
+
+    // Setting Wifi power to 8.5 dBm (34) to prevent brownouts. Or 20 dBm (80)
+    unsafe { esp_idf_sys::esp_wifi_set_max_tx_power(80); }
     info!("Starting wifi...");
     wifi.start()?;
-    info!("Scanning...");
-
-    let ap_infos = wifi.scan()?;
-
-    info!("Scan found {} access points:", ap_infos.len());
-    for ap in &ap_infos {
-        info!("  SSID: {:?}, channel: {}, signal: {} dBm", ap.ssid, ap.channel, ap.signal_strength);
-    }
-
-    let ours = ap_infos.into_iter().find(|a| a.ssid == ssid);
-    let channel = if let Some(ours) = ours {
-        info!("Found configured access point {} on channel {}", ssid, ours.channel);
-        Some(ours.channel)
-    } else {
-        info!("Configured access point {} not found during scanning, will go with unknown channel", ssid);
-        None
-    };
 
     wifi.set_configuration(&Configuration::Client(ClientConfiguration {
         ssid: ssid.try_into().expect("Could not parse the given SSID into WiFi config"),
         password: pass.try_into().expect("Could not parse the given password into WiFi config"),
-        channel,
+        channel: None,
         auth_method,
         ..Default::default()
     }))?;

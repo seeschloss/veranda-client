@@ -3,7 +3,7 @@
 use esp_idf_hal::{
     uart::UartDriver,
     units::Hertz,
-    gpio::{OutputPin, PinDriver, Output},
+    gpio::{PinDriver, Output},
 };
 use log::info;
 use anyhow::{anyhow, Result, bail};
@@ -31,18 +31,18 @@ impl std::error::Error for QuectelError {
     }
 }
 
-pub struct QuectelModule<'a, P1: OutputPin, P2: OutputPin> {
+pub struct QuectelModule<'a> {
     uart: UartDriver<'a>,
-    power_pin: PinDriver<'a, P1, Output>,
-    sleep_pin: Option<PinDriver<'a, P2, Output>>,
+    power_pin: PinDriver<'a, Output>,
+    sleep_pin: Option<PinDriver<'a, Output>>,
     is_connected: bool,
 }
 
-impl<'a, P1: OutputPin, P2: OutputPin> QuectelModule<'a, P1, P2> {
+impl<'a> QuectelModule<'a> {
     pub fn new(
         uart: UartDriver<'a>,
-        power_pin: PinDriver<'a, P1, Output>,
-        sleep_pin: Option<PinDriver<'a, P2, Output>>
+        power_pin: PinDriver<'a, Output>,
+        sleep_pin: Option<PinDriver<'a, Output>>
     ) -> Self {
         Self {
             uart,
@@ -175,22 +175,21 @@ impl<'a, P1: OutputPin, P2: OutputPin> QuectelModule<'a, P1, P2> {
 
         info!("Detecting current UART speed and changing to {} baud", target_rate);
 
-        // Try to detect current baudrate by testing communication
+        let boot_deadline = std::time::Instant::now() + Duration::from_secs(15);
         let mut current_detected_rate = None;
 
-        for &rate in &common_rates {
-            info!("Testing communication at {} baud", rate);
-
-            if let Ok(_) = self.uart.change_baudrate(Hertz(rate)) {
+        'outer: while std::time::Instant::now() < boot_deadline {
+            for &rate in &common_rates {
+                if self.uart.change_baudrate(Hertz(rate)).is_err() { continue; }
                 thread::sleep(Duration::from_millis(100));
-
-                // Test communication with a short timeout using send_at_command
-                if let Ok(_) = self.send_at_command("AT", "OK", Duration::from_millis(500)) {
+                if self.send_at_command("AT", "OK", Duration::from_millis(500)).is_ok() {
                     info!("Found current baudrate: {} baud", rate);
                     current_detected_rate = Some(rate);
-                    break;
+                    break 'outer;
                 }
             }
+            info!("Modem not responding yet, waiting...");
+            thread::sleep(Duration::from_millis(500));
         }
 
         match current_detected_rate {
@@ -199,7 +198,6 @@ impl<'a, P1: OutputPin, P2: OutputPin> QuectelModule<'a, P1, P2> {
                 Ok(())
             },
             Some(_) => {
-                // Now change to target speed
                 self.set_uart_speed(target_speed)
             },
             None => {
@@ -302,6 +300,7 @@ impl<'a, P1: OutputPin, P2: OutputPin> QuectelModule<'a, P1, P2> {
 
         //self.detect_and_set_uart_speed(Hertz(921600))?;
         //self.detect_and_set_uart_speed(Hertz(460800))?;
+        self.detect_and_set_uart_speed(Hertz(230400))?;
 
         // Test communication
         self.send_at_command_until("AT", "OK", Duration::from_secs(5), 30)?;
@@ -370,8 +369,18 @@ impl<'a, P1: OutputPin, P2: OutputPin> QuectelModule<'a, P1, P2> {
 
         // Activate PDP context
         self.send_at_command("AT+CGACT=1,1", "OK", Duration::from_secs(30))?;
-
-        self.send_at_command("AT+QIACT?", "OK", Duration::from_secs(30))?;
+        // Also activate the Quectel socket stack context
+        match self.send_at_command("AT+QIACT=1", "OK", Duration::from_secs(30)) {
+            Ok(_) => {},
+            Err(e) => {
+                // May already be active — check rather than bail
+                let status = self.send_at_command("AT+QIACT?", "OK", Duration::from_secs(10))?;
+                if !status.contains("+QIACT:") {
+                    return Err(e);
+                }
+                info!("QIACT already active, continuing...");
+            }
+        }
 
         // Check if we got an IP address
         self.send_at_command("AT+CGPADDR=1", "+CGPADDR:", Duration::from_secs(5))?;
@@ -386,45 +395,57 @@ impl<'a, P1: OutputPin, P2: OutputPin> QuectelModule<'a, P1, P2> {
             bail!("Network not connected. Call initialize_network first.");
         }
 
-        let _ = self.send_at_command("AT+QISTATE", "+QISTATE:", Duration::from_secs(5));
-        //let _ = self.send_at_command("AT+QICSGP=1,1,\"simbase\",\"\",\"\",0", "OK", Duration::from_secs(5));
-        let _ = self.send_at_command("AT+QICSGP=1", "OK", Duration::from_secs(5));
-        //let _ = self.send_at_command("AT+QIACT=1", "OK", Duration::from_secs(5));
-        let _ = self.send_at_command("AT+QIACT?", "OK", Duration::from_secs(5));
+        // Ensure the Quectel socket stack's PDP context is active.
+        // AT+CGACT activates the 3GPP bearer; AT+QIACT activates the separate
+        // Quectel socket-layer context that AT+QIOPEN requires.
+        // If QIACT? returns no "+QIACT:" line, activate it now.
+        let qiact_status = self.send_at_command("AT+QIACT?", "OK", Duration::from_secs(10))
+            .unwrap_or_default();
+        if !qiact_status.contains("+QIACT:") {
+            info!("QIACT context not active, activating...");
+            self.send_at_command("AT+QIACT=1", "OK", Duration::from_secs(30))
+                .map_err(|e| anyhow!("Failed to activate QIACT context: {}", e))?;
+            // Confirm it's up
+            let check = self.send_at_command("AT+QIACT?", "OK", Duration::from_secs(10))?;
+            if !check.contains("+QIACT:") {
+                bail!("QIACT context activation did not produce an IP address");
+            }
+        }
 
-        let _ = self.send_at_command("AT+QIDNSCFG=1", "OK", Duration::from_secs(5));
-//        let _ = self.send_at_command("AT+QIDNSGIP=1,\"www.google.com\"", "OK", Duration::from_secs(5));
-//        self.wait_for_response("+QIURC", Duration::from_secs(15))?;
-
-        //info!("10.1");
-        //thread::sleep(Duration::from_millis(10_000));
-        //info!("10.2");
-        //FreeRtos::delay_ms(10_000);
-        //info!("10.3");
-
-        //let _ = self.send_at_command("AT+QPING=1,\"8.8.8.8\"", "OK", Duration::from_secs(5));
-        //self.wait_for_response("QPING", Duration::from_secs(150))?;
-
-        let _ = self.send_at_command("AT+QICLOSE=0", "OK", Duration::from_secs(5));
-        //let _ = self.send_at_command("AT+QPING=1,8.8.8.8", "OK", Duration::from_secs(5));
-        //let _ = self.send_at_command("AT+QPING=1,\"8.8.8.8\"", "OK", Duration::from_secs(5));
-        //let _ = self.send_at_command("AT+QISTATE?", "OK", Duration::from_secs(5));
-
-        //let dns_cmd = format!("AT+QIDNSGIP=1,\"{}\"", host);
-        //self.send_at_command(&dns_cmd, "OK", Duration::from_secs(150))?;
-        //self.wait_for_response("+QIURC", Duration::from_secs(150))?;
+        // Close socket 0 only if it's actually open
+        let state = self.send_at_command("AT+QISTATE=0,0", "OK", Duration::from_secs(5))
+            .unwrap_or_default();
+        if state.contains("+QISTATE:") {
+            let _ = self.send_at_command("AT+QICLOSE=0", "OK", Duration::from_secs(10));
+            thread::sleep(Duration::from_millis(500));
+        }
 
         info!("Opening TCP connection to {}:{}", host, port);
-
-        // Open TCP socket connection
         let connect_cmd = format!("AT+QIOPEN=1,0,\"TCP\",\"{}\",{},0,0", host, port);
         self.send_at_command(&connect_cmd, "OK", Duration::from_secs(10))?;
 
-        // Wait for connection confirmation
-        self.wait_for_response("+QIOPEN", Duration::from_secs(150), false)?;
+        // Wait for async URC and check its error code
+        let urc = self.wait_for_response("+QIOPEN:", Duration::from_secs(150), false)?;
+
+        // Parse "+QIOPEN: <socket>,<err>" — err must be 0
+        if let Some(pos) = urc.find("+QIOPEN:") {
+            let after = urc[pos + 8..].trim_start();
+            if let Some(comma) = after.find(',') {
+                let err_str: String = after[comma + 1..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(code) = err_str.parse::<u32>() {
+                    if code != 0 {
+                        bail!("TCP connection failed: +QIOPEN error code {} \
+                           (566=QIACT not ready, check AT+QIACT=1)", code);
+                    }
+                }
+            }
+        }
 
         info!("TCP connection established (socket 0)");
-        Ok(0) // Return socket ID
+        Ok(0)
     }
 
     pub fn close_tcp_connection(&mut self, socket_id: u8) -> Result<()> {
@@ -455,33 +476,128 @@ impl<'a, P1: OutputPin, P2: OutputPin> QuectelModule<'a, P1, P2> {
         Ok(())
     }
 
+    /// Read exactly one AT+QIRD chunk from the modem.
+    /// Returns the raw payload bytes for that chunk (not including AT framing).
+    /// Returns an empty Vec if the modem reports 0 bytes available.
+    fn read_one_qird_chunk(&mut self, socket_id: u8, max_len: usize) -> Result<Vec<u8>> {
+        self.uart.write(format!("AT+QIRD={},{}\r\n", socket_id, max_len).as_bytes())?;
+
+        let timeout = Duration::from_secs(10);
+        let start = std::time::Instant::now();
+        let mut at_buf: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 256];
+
+        // Collect bytes until we see the "+QIRD: <len>\r\n" header line
+        let declared_len: usize;
+        loop {
+            if start.elapsed() > timeout {
+                bail!("Timeout waiting for +QIRD: header");
+            }
+            match self.uart.read(&mut tmp, 100) {
+                Ok(n) if n > 0 => at_buf.extend_from_slice(&tmp[..n]),
+                _ => { thread::sleep(Duration::from_millis(5)); continue; }
+            }
+            if let Some(pos) = at_buf.windows(2).position(|w| w == b"\r\n") {
+                let line = String::from_utf8_lossy(&at_buf[..pos]);
+                if let Some(after) = line.strip_prefix("+QIRD:") {
+                    let len_str = after.trim();
+                    declared_len = len_str.parse::<usize>()
+                        .map_err(|_| anyhow::anyhow!("Bad +QIRD: length: {}", len_str))?;
+                    at_buf.drain(..pos + 2);
+                    break;
+                }
+                // Discard other lines (echo, blank lines)
+                at_buf.drain(..pos + 2);
+            }
+        }
+
+        if declared_len == 0 {
+            return Ok(Vec::new());
+        }
+
+        info!("QIRD chunk: declared {} bytes", declared_len);
+
+        // at_buf already holds whatever arrived alongside the header line.
+        let mut payload: Vec<u8> = at_buf;
+        let start2 = std::time::Instant::now();
+        while payload.len() < declared_len {
+            if start2.elapsed() > timeout {
+                bail!("Timeout reading QIRD payload ({}/{} bytes)", payload.len(), declared_len);
+            }
+            match self.uart.read(&mut tmp, 100) {
+                Ok(n) if n > 0 => payload.extend_from_slice(&tmp[..n]),
+                _ => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+
+        // payload may contain bytes beyond declared_len (the trailing \r\nOK\r\n
+        // and possibly the start of the next +QIURC or +QIRD header).
+        // We MUST NOT call wait_for_response("OK") here — that would consume
+        // bytes that belong to the next chunk.  Instead, just discard everything
+        // after declared_len; the AT framing bytes (\r\nOK\r\n) are only 6 bytes
+        // and will be skipped by the header-scanning loop on the next call because
+        // it discards any line that doesn't start with "+QIRD:".
+        payload.truncate(declared_len);
+
+        Ok(payload)
+    }
+
     pub fn receive_tcp_data(&mut self, socket_id: u8, max_len: usize) -> Vec<u8> {
         let recv_cmd = format!("AT+QIRD={},{}", socket_id, max_len);
-        if let Ok(response) = self.send_at_command(&recv_cmd, "+QIRD:", Duration::from_secs(10)) {
+        // First, wait just for the +QIRD: header line to learn the data length
+        if let Ok(header_response) = self.send_at_command(&recv_cmd, "+QIRD:", Duration::from_secs(10)) {
 
-            info!("QIRD response: {}", response);
-
-            // Parse the response to extract the actual data
-            // Format: +QIRD: <data_len>\r\n<data>
-            if let Some(data_start) = response.find("+QIRD:") {
-                let after_qird = &response[data_start + 6..];
+            // Parse the declared data length from the +QIRD: header
+            // Format: +QIRD: <data_len>\r\n<data>\r\nOK
+            if let Some(data_start) = header_response.find("+QIRD:") {
+                let after_qird = &header_response[data_start + 6..];
                 if let Some(newline_pos) = after_qird.find("\r\n") {
                     let data_len_str = after_qird[..newline_pos].trim();
                     info!("QIRD length: {}", data_len_str);
                     if let Ok(data_len) = data_len_str.parse::<usize>() {
-                        info!("QIRD length (parsed): {} (response length: {})", data_len, response.len());
-                        if data_len > 0 {
-                            let data_start_idx = data_start + 6 + newline_pos + 2;
-                            if response.len() >= data_start_idx + data_len {
-                                return response.as_bytes()[data_start_idx..data_start_idx + data_len].to_vec();
-                            }
+                        if data_len == 0 {
+                            return Vec::new();
                         }
+
+                        // We already have some bytes after the header in header_response.
+                        // Keep reading until we have all data_len bytes (plus trailing OK).
+                        let data_offset = data_start + 6 + newline_pos + 2;
+                        let already_have = header_response.as_bytes()
+                            .get(data_offset..)
+                            .map(|s| s.to_vec())
+                            .unwrap_or_default();
+
+                        let mut data_buf: Vec<u8> = already_have;
+
+                        // Read more until we have all data_len bytes
+                        if data_buf.len() < data_len {
+                            let remaining = data_len - data_buf.len();
+                            // wait_for_response with "OK" will keep reading until the trailing OK
+                            // but we really just need enough bytes; use a generous timeout
+                            let start = std::time::Instant::now();
+                            let timeout = Duration::from_secs(10);
+                            let mut tmp = [0u8; 256];
+                            while data_buf.len() < data_len && start.elapsed() < timeout {
+                                match self.uart.read(&mut tmp, 100) {
+                                    Ok(n) if n > 0 => data_buf.extend_from_slice(&tmp[..n]),
+                                    _ => thread::sleep(Duration::from_millis(10)),
+                                }
+                            }
+                            let _ = remaining; // suppress unused warning
+                        }
+
+                        info!("QIRD length (parsed): {} (received: {})", data_len, data_buf.len());
+
+                        // Drain any trailing \r\nOK\r\n from the modem
+                        let _ = self.wait_for_response("OK", Duration::from_secs(3), true);
+
+                        return data_buf[..data_len.min(data_buf.len())].to_vec();
                     }
                 }
             }
         }
 
-        "".as_bytes().to_vec()
+        Vec::new()
     }
 
     pub fn send_http_request(&mut self, method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8]>) -> Result<HttpResponse> {
@@ -510,24 +626,18 @@ impl<'a, P1: OutputPin, P2: OutputPin> QuectelModule<'a, P1, P2> {
         // Build HTTP request
         let mut request = format!("{} {} HTTP/1.1\r\nHost: {}\r\n", method, path, host);
 
-        // If there's a body and thhere is no explicit "Content-Length" header, let's add one
+        // Add caller-supplied headers
+        for (key, value) in headers {
+            request.push_str(&format!("{}: {}\r\n", key, value));
+        }
+
+        // Add Content-Length if we have a body and the caller hasn't provided one
         if let Some(body) = body {
             if !headers.iter().any(|&(key, _)| key.eq_ignore_ascii_case("content-length")) {
                 request.push_str(&format!("Content-Length: {}\r\n", body.len()));
             }
         }
 
-        // Add headers
-        for (key, value) in headers {
-            request.push_str(&format!("{}: {}\r\n", key, value));
-        }
-
-        // Add content length if we have a body
-        if let Some(body) = body {
-            request.push_str(&format!("Content-Length: {}\r\n", body.len()));
-        }
-
-        // Add connection close header
         request.push_str("Connection: close\r\n");
         request.push_str("\r\n");
 
@@ -536,40 +646,91 @@ impl<'a, P1: OutputPin, P2: OutputPin> QuectelModule<'a, P1, P2> {
 
         // Send body if present
         if let Some(body) = body {
-            // Cannot exceed 1460 bytes
-            //const CHUNK_SIZE: usize = 512;
             const CHUNK_SIZE: usize = 1024;
             let mut total_sent = 0;
-
             for chunk in body.chunks(CHUNK_SIZE) {
                 self.send_tcp_data(socket_id, chunk, 10)?;
                 total_sent += chunk.len();
-
-                thread::sleep(Duration::from_millis(10)); // Small delay between chunks
-
-                if total_sent % (CHUNK_SIZE * 100) == 0 {
-                    info!("Sent: {}/{} bytes ({:.1}%)", 
-                         total_sent, 
-                         body.len(), 
+                thread::sleep(Duration::from_millis(10));
+                if total_sent % (CHUNK_SIZE * 10) == 0 {
+                    info!("Sent: {}/{} bytes ({:.1}%)",
+                         total_sent, body.len(),
                          (total_sent as f32 / body.len() as f32) * 100.0);
                 }
             }
         }
 
-        // Read response
-        //self.wait_for_response("+QIURC", Duration::from_secs(10))?;
+        // No need to wait for +QIURC: "recv" — in manual-receive mode (access
+        // mode 0) we can poll AT+QIRD directly.  The modem returns +QIRD: 0
+        // when nothing is buffered yet; we just back off briefly and retry.
+        // URCs (+QIURC: "recv", +QIURC: "closed") will appear in the UART
+        // stream but read_one_qird_chunk discards any line that isn't +QIRD:.
 
-        self.wait_for_response("+QIURC: \"recv\"", Duration::from_secs(5), false)?;
+        // ---------------------------------------------------------------
+        // Receive the full HTTP response as raw bytes, polling AT+QIRD.
+        // We work in bytes throughout so binary bodies (firmware images)
+        // are never mangled by a UTF-8 decoder.
+        // ---------------------------------------------------------------
+        const QIRD_CHUNK: usize = 1460;
+        let mut raw: Vec<u8> = Vec::new();
+        let mut content_length: Option<usize> = None;
+        let mut header_end: Option<usize> = None;
+        let mut consecutive_empty: u32 = 0;
+        const MAX_EMPTY: u32 = 100; // 100 × 50 ms = 5 s stall timeout
 
-        let response = self.receive_tcp_data(socket_id, 1024);
+        loop {
+            let chunk = self.read_one_qird_chunk(socket_id, QIRD_CHUNK)?;
+            if chunk.is_empty() {
+                // Nothing buffered yet — check if we already have everything
+                if let (Some(hdr_end), Some(cl)) = (header_end, content_length) {
+                    if raw.len().saturating_sub(hdr_end) >= cl {
+                        break;
+                    }
+                }
+                consecutive_empty += 1;
+                if consecutive_empty >= MAX_EMPTY {
+                    bail!("Stalled: no data received for 5 s ({}/{} bytes)",
+                          raw.len().saturating_sub(header_end.unwrap_or(0)),
+                          content_length.unwrap_or(0));
+                }
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            consecutive_empty = 0;
+            raw.extend_from_slice(&chunk);
 
-        // Close connection
+            // Find header/body separator and Content-Length once
+            if header_end.is_none() {
+                if let Some(sep) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    header_end = Some(sep + 4);
+                    let header_str = String::from_utf8_lossy(&raw[..sep]);
+                    for line in header_str.lines() {
+                        if let Some(rest) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            if let Ok(n) = rest.trim().parse::<usize>() {
+                                content_length = Some(n);
+                                info!("HTTP Content-Length: {}", n);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Stop as soon as we have all body bytes
+            if let (Some(hdr_end), Some(cl)) = (header_end, content_length) {
+                let body_received = raw.len().saturating_sub(hdr_end);
+                if body_received % (64 * 1024) < QIRD_CHUNK {
+                    info!("HTTP body progress: {}/{} bytes", body_received, cl);
+                }
+                if body_received >= cl {
+                    break;
+                }
+            }
+        }
+
         let _ = self.close_tcp_connection(socket_id);
+        info!("HTTP response received ({} total bytes)", raw.len());
 
-        let response_str = String::from_utf8_lossy(&response);
-        info!("HTTP response received ({} bytes)", response.len());
-
-        Ok(parse_http_response(&response_str))
+        Ok(parse_http_response_bytes(&raw))
     }
 
     pub fn http_post(&mut self, url: &str, body: &[u8], headers: &[(&str, &str)]) -> Result<HttpResponse> {
@@ -597,9 +758,9 @@ impl<'a, P1: OutputPin, P2: OutputPin> QuectelModule<'a, P1, P2> {
     }
 }
 
-use crate::modem::{Modem, HttpResponse, parse_http_response};
+use crate::modem::{Modem, HttpResponse, parse_http_response_bytes};
 
-impl<'a, P1: OutputPin, P2: OutputPin> Modem for QuectelModule<'a, P1, P2> {
+impl<'a> Modem for QuectelModule<'a> {
     fn initialize_network(&mut self, apn: &str) -> Result<()> {
         self.initialize_network(apn)
     }
@@ -622,4 +783,3 @@ impl<'a, P1: OutputPin, P2: OutputPin> Modem for QuectelModule<'a, P1, P2> {
         self.is_connected()
     }
 }
-

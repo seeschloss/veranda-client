@@ -10,35 +10,42 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 
 use esp_idf_hal::i2c::{self, I2cDriver};
 
+use esp_idf_sys::{
+    soc_periph_temperature_sensor_clk_src_t_TEMPERATURE_SENSOR_CLK_SRC_DEFAULT,
+    temperature_sensor_config_t, temperature_sensor_enable, temperature_sensor_get_celsius,
+    temperature_sensor_handle_t, temperature_sensor_install,
+};
+
 use log::*;
 use std::time::Duration;
 use std::thread;
+
+//mod dcim;
+mod board;
+
+mod ota;
+
+mod modem;
 
 #[cfg(feature = "modem-wifi")]
 mod wifi;
 
 #[cfg(feature = "modem-wifi")]
-use wifi::wifi;
-
-mod dcim;
-mod board;
-
-mod simcom;
-mod quectel;
-mod modem;
-
-mod ota;
+use wifi::WifiModem;
 
 #[cfg(feature = "modem-simcom")]
 use simcom::SimcomModule as Modem;
 
+#[cfg(feature = "modem-simcom")]
+mod simcom;
+
 #[cfg(feature = "modem-quectel")]
 use quectel::QuectelModule as Modem;
 
-#[cfg(feature = "modem-wifi")]
-use wifi::WifiModem;
+#[cfg(feature = "modem-quectel")]
+mod quectel;
 
-use dcim::{SDSPIHost, DCIM};
+//use dcim::{SDSPIHost, DCIM};
 
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 use std::sync::Arc;
@@ -51,6 +58,14 @@ const FIRMWARE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION_MAJOR"), ".", env
 #[used]
 #[no_mangle]
 static FIRMWARE_VERSION_TAG: &[u8] = concat!("ATHENA_FIRMWARE_VERSION:", env!("CARGO_PKG_VERSION_MAJOR"), ".", env!("CARGO_PKG_VERSION_MINOR"), "\0").as_bytes();
+
+#[used]
+#[no_mangle]
+static FIRMWARE_MODEM_TAG: &[u8] = concat!("ATHENA_MODEM:", env!("ATHENA_MODEM"), "\0").as_bytes();
+
+#[used]
+#[no_mangle]
+static FIRMWARE_BOARD_TAG: &[u8] = concat!("ATHENA_BOARD:", env!("ATHENA_BOARD"), "\0").as_bytes();
 
 // ESP32 sleeping time between pictures (should actually be powered down by the nRF)
 const SLEEP_MINUTES: u64 = 30;
@@ -155,6 +170,23 @@ fn main() {
 
     info!("Athena booting up with version {}", FIRMWARE_VERSION);
 
+    let mut temp_sensor: temperature_sensor_handle_t = std::ptr::null_mut();
+    let temp_sensor_config = temperature_sensor_config_t {
+        range_min: 10,
+        range_max: 50,
+        clk_src: soc_periph_temperature_sensor_clk_src_t_TEMPERATURE_SENSOR_CLK_SRC_DEFAULT,
+        ..Default::default()
+    };
+
+    let mut esp32_internal_temperature: f32 = 0.0;
+
+    unsafe {
+        temperature_sensor_install(&temp_sensor_config, &mut temp_sensor);
+        temperature_sensor_enable(temp_sensor);
+        temperature_sensor_get_celsius(temp_sensor, &mut esp32_internal_temperature);
+    }
+
+
     let shared_box = Arc::new(PowerData::default());
     let shared_bool_task_running = Arc::new(AtomicBool::new(true));
 
@@ -167,25 +199,33 @@ fn main() {
         }
     };
 
-    let mut led_pin = match PinDriver::output(board::pin(board::pins::LED)) {
-        Ok(led_pin) => Some(led_pin),
-        Err(_) => None,
-    };
+    let mut sleep_signal_pin = board::pin(board::pins::SLEEP_SIGNAL)
+        .and_then(|p| PinDriver::output(p).ok());
+
+    if let Some(ref mut sleep_signal_pin) = sleep_signal_pin {
+        info!("Setting sleep signal to high.");
+        let _ = sleep_signal_pin.set_high();
+    }
+
+    let mut led_pin = board::pin(board::pins::LED)
+        .and_then(|p| PinDriver::output(p).ok());
 
     if let Some(ref mut led_pin) = led_pin {
         let _ = led_pin.set_low();
     }
 
-    if let Ok(i2c) = i2c::I2cDriver::new(
-        peripherals.i2c0,
-        board::pin(board::pins::I2C_SDA),
-        board::pin(board::pins::I2C_SCL),
-        &i2c::I2cConfig::new().baudrate(Hertz(400_000)),
-    ) {
-        spawn_ina3221_monitoring_task(INA3221::new(i2c, INA3221_I2C_ADDR), shared_box.clone(), shared_bool_task_running.clone());
+    if let (Some(sda), Some(scl)) = (board::pin(board::pins::I2C_SDA), board::pin(board::pins::I2C_SCL)) {
+        if let Ok(i2c) = i2c::I2cDriver::new(
+            peripherals.i2c0,
+            sda,
+            scl,
+            &i2c::I2cConfig::new().baudrate(Hertz(400_000)),
+        ) {
+            spawn_ina3221_monitoring_task(INA3221::new(i2c, INA3221_I2C_ADDR), shared_box.clone(), shared_bool_task_running.clone());
+        }
     }
 
-    let sysloop = match EspSystemEventLoop::take() {
+    let _sysloop = match EspSystemEventLoop::take() {
         Ok(sysloop) => sysloop,
         Err(e) => {
             println!("Failed to take ESP event loop: {:?}, retrying in 1 second...", e);
@@ -194,11 +234,13 @@ fn main() {
         }
     };
 
+    let mut gsm_module: Option<Box<dyn modem::Modem>> = None;
+
     #[cfg(feature = "modem-wifi")]
     let mut gsm_module: Option<Box<dyn modem::Modem>> = {
         const WIFI_SSID: &str = env!("WIFI_SSID");
         const WIFI_PASS: &str = env!("WIFI_PASS");
-        match wifi::wifi(WIFI_SSID, WIFI_PASS, peripherals.modem, sysloop) {
+        match wifi::wifi(WIFI_SSID, WIFI_PASS, peripherals.modem, _sysloop) {
             Ok(wifi) => {
                 info!("WiFi connected, using WifiModem");
                 Some(Box::new(WifiModem::new(wifi)))
@@ -211,35 +253,45 @@ fn main() {
     };
 
     #[cfg(not(feature = "modem-wifi"))]
-    let mut gsm_module: Option<Box<dyn modem::Modem>> = match UartDriver::new(
-        peripherals.uart1,
-        board::pin(board::pins::GSM_TX),
-        board::pin(board::pins::GSM_RX),
-        Option::<esp_idf_hal::gpio::AnyIOPin>::None,
-        Option::<esp_idf_hal::gpio::AnyIOPin>::None,
-        &UartConfig::new().baudrate(esp_idf_hal::units::Hertz(115200)),
-    ) {
-        Ok(uart) => {
-            let sleep_pin = match PinDriver::output(board::pin(board::pins::GSM_SLP)) {
-                Ok(sleep_pin) => Some(sleep_pin),
-                Err(_) => None,
-            };
+    if let (Some(tx), Some(rx), Some(sleep), Some(pwr)) = (board::pin(board::pins::GSM_TX), board::pin(board::pins::GSM_RX), board::pin(board::pins::GSM_SLP), board::pin(board::pins::GSM_PWR)) {
+        let mut gsm_module: Option<Box<dyn modem::Modem>> = match UartDriver::new(
+            peripherals.uart1,
+            tx,
+            rx,
+            Option::<esp_idf_hal::gpio::AnyIOPin>::None,
+            Option::<esp_idf_hal::gpio::AnyIOPin>::None,
+            &UartConfig::new().baudrate(esp_idf_hal::units::Hertz(115200)),
+        ) {
+            Ok(uart) => {
+                let sleep_pin = match PinDriver::output(sleep) {
+                    Ok(sleep_pin) => Some(sleep_pin),
+                    Err(_) => None,
+                };
 
-            match PinDriver::output(board::pin(board::pins::GSM_PWR)) {
-                Ok(power_pin) => Some(Box::new(Modem::new(uart, power_pin, sleep_pin))),
-                Err(e) => {
-                    println!("Failed to initialize 4G module power pin: {:?}, continuing without 4G", e);
-                    None
-                },
-            }
-        },
-        Err(e) => {
-            println!("Failed to initialize 4G module UART: {:?}, continuing without 4G", e);
-            None
-        },
-    };
+                match PinDriver::output(pwr) {
+                    Ok(power_pin) => Some(Box::new(Modem::new(uart, power_pin, sleep_pin))),
+                    Err(e) => {
+                        println!("Failed to initialize 4G module power pin: {:?}, continuing without 4G", e);
+                        None
+                    },
+                }
+            },
+            Err(e) => {
+                println!("Failed to initialize 4G module UART: {:?}, continuing without 4G", e);
+                None
+            },
+        };
+    }
 
-    let camera = match Camera::new(
+    let mut camera: Option<Camera> = None;
+
+    #[cfg(any(feature = "board-xiao", feature = "board-wroom"))]
+    if let (
+        Some(xclk), Some(sda), Some(scl),
+        Some(d0), Some(d1), Some(d2), Some(d3),
+        Some(d4), Some(d5), Some(d6), Some(d7),
+        Some(vsync), Some(href), Some(pclk),
+    ) = (
         board::pin(board::pins::CAM_XCLK),
         board::pin(board::pins::CAM_SDA),
         board::pin(board::pins::CAM_SCL),
@@ -254,21 +306,39 @@ fn main() {
         board::pin(board::pins::CAM_VSYNC),
         board::pin(board::pins::CAM_HREF),
         board::pin(board::pins::CAM_PCLK),
-        10_000_000, // ~8 MHz to ~20 MHz
-        19,   // 4 (best) to 19 (worst)
-        2,
-        camera::camera_grab_mode_t_CAMERA_GRAB_LATEST,
-        camera::framesize_t_FRAMESIZE_QSXGA,
-    ) {
-        Ok(camera) => {
-            let _ = camera.sensor().set_hmirror(true);
-            Some(camera)
-        },
-        Err(e) => {
-            println!("Failed to initialize camera: {:?}, continuing without images", e);
-            None
-        },
-    };
+        ) {
+        camera = match Camera::new(
+            xclk,
+            sda,
+            scl,
+            d0,
+            d1,
+            d2,
+            d3,
+            d4,
+            d5,
+            d6,
+            d7,
+            vsync,
+            href,
+            pclk,
+            10_000_000, // ~8 MHz to ~20 MHz
+            19,   // 4 (best) to 19 (worst)
+            2,
+            camera::camera_grab_mode_t_CAMERA_GRAB_LATEST,
+            camera::framesize_t_FRAMESIZE_QSXGA,
+        ) {
+            Ok(camera) => {
+                let _ = camera.sensor().set_hmirror(true);
+                Some(camera)
+            },
+            Err(e) => {
+                println!("Failed to initialize camera: {:?}, continuing without images", e);
+                None
+            },
+        };
+    }
+    //
 
     let mac_string = unsafe {
         let mut base_mac = [0u8; 6];
@@ -279,7 +349,7 @@ fn main() {
                 base_mac[3], base_mac[4], base_mac[5])
     };
 
-    let mut sdcard: Option<SDSPIHost> = None;
+    //let mut sdcard: Option<SDSPIHost> = None;
     /*{
         let mut host = SDSPIHost::new();
         match host.mount() {
@@ -298,6 +368,7 @@ fn main() {
                     let image_data = frame.data();
                     info!("Photo captured successfully: {} bytes", image_data.len());
 
+                    /*
                     if let Some(ref mut sdcard) = sdcard {
                         let next_number = sdcard.next_number("ATH_");
                         let next_filename = format!("ATH_{}.JPG", next_number);
@@ -305,6 +376,7 @@ fn main() {
                             info!("Could not write to SD card: {:?}", e);
                         }
                     }
+                    */
 
                     if let Some(ref mut gsm_module) = gsm_module {
                         //if let Err(e) = gsm_module.wake() {
@@ -328,9 +400,11 @@ fn main() {
                             ("Content-Type", "application/json"),
                             ("X-Board-Id", mac_string.as_str()),
                             ("X-Firmware-Version", FIRMWARE_VERSION),
+                            ("X-Firmware-Modem", env!("ATHENA_MODEM")),
+                            ("X-Firmware-Board", env!("ATHENA_BOARD")),
                         ];
 
-                        let json_data = format!("{{ \"{}\": {}, \"{}\": {}, \"{}\": {}, \"{}\": {}, \"{}\": {}, \"{}\": {}, \"{}\": {}, \"{}\": {} }}",
+                        let json_data = format!("{{ \"{}\": {}, \"{}\": {}, \"{}\": {}, \"{}\": {}, \"{}\": {}, \"{}\": {}, \"{}\": {}, \"{}\": {}, \"{}\": {} }}",
                             "battery", format!("{{ \"type\":\"voltage\",\"value\":{} }}", shared_box.ch3_voltage.load(Ordering::Relaxed) as f32 / 1000.0),
                             "board_supply", format!("{{ \"type\":\"voltage\",\"value\":{} }}", shared_box.ch1_voltage.load(Ordering::Relaxed) as f32 / 1000.0),
                             "battery_charging", format!("{{ \"type\":\"voltage\",\"value\":{} }}", shared_box.ch2_voltage.load(Ordering::Relaxed) as f32 / 1000.0),
@@ -339,6 +413,7 @@ fn main() {
                             "supply_current", format!("{{ \"type\":\"current\",\"value\":{} }}", shared_box.ch1_current.load(Ordering::Relaxed) as f32 / 1000.0),
                             "quectel_voltage", format!("{{ \"type\":\"voltage\",\"value\":{} }}", modem_voltage),
                             "photo_size", format!("{{ \"type\":\"generic\",\"value\":{} }}", image_data.len()),
+                            "temperature", format!("{{ \"type\":\"temperature\",\"value\":{} }}", esp32_internal_temperature),
                         );
 
                         info!("CPU0 power data: {:?}", shared_box);
@@ -363,8 +438,17 @@ fn main() {
                                         ];
                                         match gsm_module.http_get(&fw_url, &headers) {
                                             Ok(fw_response) => {
-                                                if let Err(e) = ota::install_firmware(&fw_response.body, &fw_sha256) {
-                                                    info!("OTA failed: {:?}", e);
+                                                let expected_board_tag = concat!("ATHENA_BOARD:", env!("ATHENA_BOARD")).as_bytes();
+                                                let expected_modem_tag = concat!("ATHENA_MODEM:", env!("ATHENA_MODEM")).as_bytes();
+
+                                                if !ota::check_firmware_compatibility(&fw_response.body, expected_board_tag) {
+                                                    info!("OTA firmware is not for this board, skipping");
+                                                } else if !ota::check_firmware_compatibility(&fw_response.body, expected_modem_tag) {
+                                                    info!("OTA firmware is not for this modem, skipping");
+                                                } else {
+                                                    if let Err(e) = ota::install_firmware(&fw_response.body, &fw_sha256) {
+                                                        info!("OTA failed: {:?}", e);
+                                                    }
                                                 }
                                             }
                                             Err(e) => info!("OTA download failed: {:?}", e),
@@ -372,6 +456,8 @@ fn main() {
                                     } else {
                                         info!("Update is not newer than our version ({}), no need to update", parsed_version_current);
                                     }
+                                } else {
+                                    info!("Could not retrieve firmware update info, somehow?");
                                 }
                             }
                             Err(e) => info!("Could not send data through 4G module: {:?}", e),
@@ -381,19 +467,31 @@ fn main() {
                             ("Content-Type", "image/jpeg"),
                             ("X-Board-Id", mac_string.as_str()),
                             ("X-Firmware-Version", FIRMWARE_VERSION),
+                            ("X-Firmware-Modem", env!("ATHENA_MODEM")),
+                            ("X-Firmware-Board", env!("ATHENA_BOARD")),
                         ];
 
-                        if let Err(e) = gsm_module.http_post(PHOTO_URL, image_data, &headers) {
-                            info!("Could not send photo through 4G module: {:?}", e);
+                        let brightness = scene_brightness(camera);
+
+                        if brightness <= 0.0 || brightness > 10.0 {
+                            info!("Sending photo (brightness: {})", brightness);
+                            if let Err(e) = gsm_module.http_post(PHOTO_URL, image_data, &headers) {
+                                info!("Could not send photo through 4G module: {:?}", e);
+                            }
+                        } else {
+                            info!("Not sending photo because it's too dark (brightness: {})", brightness);
                         }
 
                         let headers = [
                             ("Content-Type", "application/json"),
                             ("X-Board-Id", mac_string.as_str()),
                             ("X-Firmware-Version", FIRMWARE_VERSION),
+                            ("X-Firmware-Modem", env!("ATHENA_MODEM")),
+                            ("X-Firmware-Board", env!("ATHENA_BOARD")),
                         ];
 
-                        let json_data = format!("{{ \"{}\": {}, \"{}\": {} }}",
+                        let json_data = format!("{{ \"{}\": {}, \"{}\": {}, \"{}\": {} }}",
+                            "brightness", format!("{{ \"type\":\"brightness\",\"value\":{} }}", brightness),
                             "battery", format!("{{ \"type\":\"voltage\",\"value\":{} }}", shared_box.ch3_voltage.load(Ordering::Relaxed) as f32 / 1000.0),
                             "board_energy_use", format!("{{ \"type\":\"energy\",\"value\":{} }}", shared_box.ch3_energy.load(Ordering::Relaxed) as f32 / 1000.0),
                         );
@@ -424,6 +522,11 @@ fn main() {
             let _ = led_pin.set_high();
         }
 
+        if let Some(ref mut sleep_signal_pin) = sleep_signal_pin {
+            info!("Setting sleep signal to low.");
+            let _ = sleep_signal_pin.set_low();
+        }
+
         shared_bool_task_running.clone().store(false, Ordering::SeqCst);
         std::thread::sleep(std::time::Duration::from_millis(100));
         thread::sleep(Duration::from_secs(60 * SLEEP_MINUTES));
@@ -434,5 +537,24 @@ fn main() {
         }
         */
     }
+}
+
+fn scene_brightness(camera: &Camera) -> f32 {
+    let sensor = camera.sensor();
+
+    // AEC exposure value: 20-bit across 0x3500[3:0], 0x3501[7:0], 0x3502[7:4]
+    let exp_hi  = sensor.get_reg(0x3500, 0x0F) as u32;
+    let exp_mid = sensor.get_reg(0x3501, 0xFF) as u32;
+    let exp_lo  = sensor.get_reg(0x3502, 0xF0) as u32;
+    let exposure = (exp_hi << 12) | (exp_mid << 4) | (exp_lo >> 4);
+
+    // AGC gain: 10-bit across 0x350A[1:0] and 0x350B[7:0]
+    let gain_hi = sensor.get_reg(0x350A, 0x03) as u32;
+    let gain_lo = sensor.get_reg(0x350B, 0xFF) as u32;
+    let gain = (gain_hi << 8) | gain_lo;
+
+    info!("AEC exposure={}, AGC gain={}", exposure, gain);
+
+    (1200.0 * 800.0) / (gain as f32 * exposure as f32)
 }
 

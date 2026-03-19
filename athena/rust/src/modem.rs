@@ -48,3 +48,30 @@ pub fn parse_http_response(raw: &str) -> HttpResponse {
     }
 }
 
+/// Binary-safe variant: splits headers and body at the \r\n\r\n boundary
+/// without passing the body through a UTF-8 decoder.  Use this whenever
+/// the response body may contain arbitrary bytes (e.g. firmware images).
+pub fn parse_http_response_bytes(raw: &[u8]) -> HttpResponse {
+    // Find the header/body separator
+    let sep = raw.windows(4).position(|w| w == b"\r\n\r\n");
+    let (header_bytes, body) = if let Some(pos) = sep {
+        (&raw[..pos], raw[pos + 4..].to_vec())
+    } else {
+        (raw, Vec::new())
+    };
+
+    let header_str = String::from_utf8_lossy(header_bytes);
+    let mut lines = header_str.lines();
+
+    let status = lines.next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let headers = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect();
+
+    HttpResponse { status, headers, body }
+}

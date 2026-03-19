@@ -9,7 +9,7 @@ use esp_idf_sys::{
 
 pub fn install_firmware(firmware: &[u8], expected_sha256: &str) -> Result<()> {
     if !verify_sha256(firmware, expected_sha256) {
-        bail!("OTA: SHA-256 mismatch");
+        bail!("OTA: SHA-256 mismatch (expected: {}, computed: {:?})", expected_sha256, Sha256::digest(firmware));
     }
     info!("OTA: SHA-256 matches");
 
@@ -52,3 +52,8 @@ fn verify_sha256(data: &[u8], expected: &str) -> bool {
         nibbles.map(|n| if n < 10 { b'0' + n } else { b'a' + n - 10 })
     })).all(|(a, b)| a == b)
 }
+
+pub fn check_firmware_compatibility(firmware: &[u8], tag: &[u8]) -> bool {
+    firmware.windows(tag.len()).any(|w| w == tag)
+}
+
