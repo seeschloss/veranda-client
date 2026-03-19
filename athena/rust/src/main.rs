@@ -254,7 +254,7 @@ fn main() {
 
     #[cfg(not(feature = "modem-wifi"))]
     if let (Some(tx), Some(rx), Some(sleep), Some(pwr)) = (board::pin(board::pins::GSM_TX), board::pin(board::pins::GSM_RX), board::pin(board::pins::GSM_SLP), board::pin(board::pins::GSM_PWR)) {
-        let mut gsm_module: Option<Box<dyn modem::Modem>> = match UartDriver::new(
+        gsm_module = match UartDriver::new(
             peripherals.uart1,
             tx,
             rx,
@@ -281,11 +281,12 @@ fn main() {
                 None
             },
         };
+    } else {
+        println!("No GSM module as not all pins are available.");
     }
 
     let mut camera: Option<Camera> = None;
 
-    #[cfg(any(feature = "board-xiao", feature = "board-wroom"))]
     if let (
         Some(xclk), Some(sda), Some(scl),
         Some(d0), Some(d1), Some(d2), Some(d3),
@@ -337,8 +338,10 @@ fn main() {
                 None
             },
         };
+    } else {
+        println!("Camera not available as not all pins are there.");
     }
-    //
+
 
     let mac_string = unsafe {
         let mut base_mac = [0u8; 6];
