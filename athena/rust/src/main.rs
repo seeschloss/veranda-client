@@ -127,7 +127,7 @@ fn main() {
     }
 
     // ── INA3221 power monitor ────────────────────────────────────────────────
-    if let (Some(sda), Some(scl)) = (
+    let i2c = if let (Some(sda), Some(scl)) = (
         board::pin(board::pins::I2C_SDA),
         board::pin(board::pins::I2C_SCL),
     ) {
@@ -136,12 +136,20 @@ fn main() {
             sda, scl,
             &i2c::I2cConfig::new().baudrate(Hertz(400_000)),
         ) {
-            power::spawn_monitoring_task(
-                INA3221::new(i2c, INA3221_I2C_ADDR),
-                power_data.clone(),
-                task_running.clone(),
-            );
+            Some(i2c)
+        } else {
+            None
         }
+    } else {
+        None
+    };
+
+    if let Some(i2c) = i2c {
+        power::spawn_monitoring_task(
+            INA3221::new(i2c, INA3221_I2C_ADDR),
+            power_data.clone(),
+            task_running.clone(),
+        );
     }
 
     // ── ESP event loop (needed for WiFi) ─────────────────────────────────────
