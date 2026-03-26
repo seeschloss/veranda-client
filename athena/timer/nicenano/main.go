@@ -129,22 +129,28 @@ func handleESPSession(adv *bluetooth.Advertisement) {
 	// Stop advertising while the ESP owns the I2C bus.
 	adv.Stop()
 
+	// Two pins to handle various boards
 	pin_power := machine.P0_08
 	pin_power.Configure(machine.PinConfig{Mode: machine.PinOutput})
+
+	pin_power_2 := machine.P0_11
+	pin_power_2.Configure(machine.PinConfig{Mode: machine.PinOutput})
 
 	pin_sleep_signal := machine.P0_29
 	pin_sleep_signal.Configure(machine.PinConfig{Mode: machine.PinInputPullup})
 
 	pin_power.High()
+	pin_power_2.High()
 
-	// Wait for the ESP to assert the signal pin high before arming the
-	// interrupt. This prevents spurious falling-edge triggers from the pin
-	// floating or bouncing low during ESP boot.
 	println("Waiting for ESP to assert signal pin high...")
-	for !pin_sleep_signal.Get() {
+
+	// Wait for the ESP to assert the signal pin high before arming the interrupt
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && !pin_sleep_signal.Get() {
 		time.Sleep(100 * time.Millisecond)
 	}
-	println("Signal pin is high, ESP has started. Watching for falling edge...")
+	println("Signal pin is high and ESP has started, or reached timeout. Watching for falling edge...")
 
 	ok := waitForInterrupt(pin_sleep_signal, ESP_LOW_DURATION, ESP_TIMEOUT)
 	if ok {
@@ -155,6 +161,7 @@ func handleESPSession(adv *bluetooth.Advertisement) {
 
 	pin_sleep_signal.SetInterrupt(machine.PinFalling, nil)
 	pin_power.Low()
+	pin_power_2.Low()
 	println("Power off")
 
 	// Resume advertising.
