@@ -3,39 +3,17 @@
 use esp_idf_hal::{
     uart::UartDriver,
     units::Hertz,
-    gpio::{OutputPin, PinDriver, Output},
+    gpio::{PinDriver, Output},
 };
 use log::info;
 use anyhow::{anyhow, Result, bail};
 use std::time::Duration;
 use std::thread;
 
-// ---------------------------------------------------------------------------
-// Error type (mirrors QuectelError for API compatibility)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug)]
-pub struct SimcomError {
-    details: String,
-}
-
-impl SimcomError {
-    pub fn new(msg: &str) -> Self {
-        Self { details: msg.to_owned() }
-    }
-}
-
-impl std::fmt::Display for SimcomError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(f, "{}", self.details)
-    }
-}
-
-impl std::error::Error for SimcomError {
-    fn description(&self) -> &str {
-        &self.details
-    }
-}
+// Use the shared error type from modem.rs.
+// For the three available options (local type / shared ModemError / pure anyhow)
+// see the comment in modem.rs.
+use crate::modem::ModemError as SimcomError;
 
 // ---------------------------------------------------------------------------
 // Main driver struct
@@ -380,7 +358,29 @@ impl<'a> SimcomModule<'a> {
     // Diagnostics
     // -----------------------------------------------------------------------
 
-    /// Read battery voltage via `AT+CBC`.
+    /// Read signal quality via `AT+CSQ`, returns an approximative dBm value
+    pub fn signal_quality(&mut self) -> Result<i32> {
+        let resp = self.send_at_command("AT+CSQ", "OK", Duration::from_secs(5))
+            .map_err(|e| anyhow!("AT+CSQ failed: {}", e))?;
+
+        if let Some(pos) = resp.find("+CSQ:") {
+            let after = resp[pos + 5..].trim_start();
+            let rssi_str: String = after.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(rssi) = rssi_str.parse::<u32>() {
+                if rssi != 99 {
+                    let dbm = -113i32 + (rssi as i32) * 2;
+
+                    return Ok(dbm);
+                }
+            }
+        }
+
+        Err(anyhow!("No signal: {}", resp))
+    }
+
+    /// Read signal quality via `AT+CSQ`
     ///
     /// The A7670 returns `+CBC: <voltage>V` where voltage is already in volts
     /// (e.g. `+CBC: 3.894V`), unlike the EG800K which returns millivolts as
@@ -574,25 +574,20 @@ impl<'a> SimcomModule<'a> {
         bail!("Network registration timed out after {}s", timeout.as_secs());
     }
 
-    /// Wait until `AT+CSQ` returns a signal-quality value other than 99
-    /// (which means "unknown / not detectable").
+    /// Wait until `AT+CSQ` returns a value other than 99 (unknown signal).
     fn wait_for_signal(&mut self, timeout: Duration) -> Result<()> {
         info!("Waiting for usable signal (CSQ != 99)...");
         let start = std::time::Instant::now();
 
         while start.elapsed() < timeout {
             if let Ok(resp) = self.send_at_command("AT+CSQ", "OK", Duration::from_secs(5)) {
-                // Response: "+CSQ: <rssi>,<ber>"  where rssi 0-31 are valid,
-                // 99 means not known / not detectable.
                 if let Some(pos) = resp.find("+CSQ:") {
                     let after = resp[pos + 5..].trim_start();
-                    let rssi_str: String = after
-                        .chars()
+                    let rssi_str: String = after.chars()
                         .take_while(|c| c.is_ascii_digit())
                         .collect();
                     if let Ok(rssi) = rssi_str.parse::<u32>() {
                         if rssi != 99 {
-                            // Convert to rough dBm for a useful log message.
                             let dbm = -113i32 + (rssi as i32) * 2;
                             info!("Signal quality: CSQ={} (~{}dBm) ({:.1}s)",
                                 rssi, dbm, start.elapsed().as_secs_f32());
@@ -917,9 +912,8 @@ impl<'a> SimcomModule<'a> {
 
         let _ = self.close_tcp_connection(socket_id);
 
-        let response_str = String::from_utf8_lossy(&response);
         info!("HTTP response received ({} bytes)", response.len());
-        Ok(parse_http_response(&response_str))
+        Ok(parse_http_response_bytes(&response))
     }
 
     pub fn http_post(&mut self, url: &str, body: &[u8], headers: &[(&str, &str)]) -> Result<HttpResponse> {
@@ -952,7 +946,7 @@ impl<'a> SimcomModule<'a> {
 }
 
 
-use crate::modem::{Modem, HttpResponse, parse_http_response};
+use crate::modem::{Modem, HttpResponse, parse_http_response_bytes};
 
 impl<'a> Modem for SimcomModule<'a> {
     fn initialize_network(&mut self, apn: &str) -> Result<()> {
@@ -963,6 +957,9 @@ impl<'a> Modem for SimcomModule<'a> {
     }
     fn http_get(&mut self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse> {
         self.http_get(url, headers)
+    }
+    fn signal_quality(&mut self) -> Result<i32> {
+        self.signal_quality()
     }
     fn battery_voltage(&mut self) -> Result<f32> {
         self.battery_voltage()

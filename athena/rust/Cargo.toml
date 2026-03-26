@@ -1,6 +1,6 @@
 [package]
 name = "athena"
-version = "2.93.0"
+version = "2.98.0"
 edition = "2021"
 resolver = "2"
 
