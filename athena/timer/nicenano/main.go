@@ -4,7 +4,6 @@ import (
 	"machine"
 	"time"
 	"device/nrf"
-	"tinygo.org/x/bluetooth"
 	"unsafe"
 )
 
@@ -18,64 +17,6 @@ const ESP_LOW_DURATION = 3 * time.Second
 // One pulse from the ESP encodes this many minutes of requested sleep.
 // Must match PULSE_UNIT_MINUTES in the Rust firmware.
 const PULSE_UNIT = 5 * time.Minute
-
-// Custom 128-bit UUIDs for the ESP trigger service.
-// Use these same UUIDs in nRF Connect to find the characteristic.
-var (
-	serviceUUID     = parseUUID("AEA00000-1789-0000-0000-000000000000")
-	triggerCharUUID = parseUUID("AEA00000-1789-0000-0000-000000000000")
-)
-
-func parseUUID(s string) bluetooth.UUID {
-	u, err := bluetooth.ParseUUID(s)
-	if err != nil {
-		panic("bad UUID: " + s)
-	}
-	return u
-}
-
-var (
-	adapter = bluetooth.DefaultAdapter
-
-	batteryLevel [2]byte
-	supplyLevel  [2]byte
-	chargeLevel  [2]byte
-
-	advertisement_options = bluetooth.AdvertisementOptions{
-		LocalName:         "ATHENE",
-		AdvertisementType: bluetooth.AdvertisingTypeInd, // connectable
-		ManufacturerData: []bluetooth.ManufacturerDataElement{
-			{CompanyID: 0x1789, Data: batteryLevel[:]},
-			{CompanyID: 0x1792, Data: supplyLevel[:]},
-			{CompanyID: 0x1794, Data: chargeLevel[:]},
-		},
-	}
-
-	// Set to true by the BLE write handler; consumed by the main loop.
-	triggerESP bool
-)
-
-func setupGATT() {
-	must("add services", adapter.AddService(
-		&bluetooth.Service{
-			UUID: serviceUUID,
-			Characteristics: []bluetooth.CharacteristicConfig{
-				{
-					UUID: triggerCharUUID,
-					// Write 0x01 to trigger an ESP session immediately.
-					Flags: bluetooth.CharacteristicWritePermission |
-						bluetooth.CharacteristicWriteWithoutResponsePermission,
-					WriteEvent: func(client bluetooth.Connection, offset int, value []byte) {
-						if len(value) > 0 && value[0] == 0x01 {
-							println("BLE trigger received, scheduling ESP session")
-							triggerESP = true
-						}
-					},
-				},
-			},
-		},
-	))
-}
 
 func startWatchdog(timeoutSeconds uint32) {
     nrf.WDT.CRV.Set(timeoutSeconds * 32768 - 1)
@@ -156,10 +97,7 @@ func decodeSignalPin(pin machine.Pin, timeout time.Duration) (int, bool) {
 	return 0, false
 }
 
-func handleESPSession(adv *bluetooth.Advertisement) time.Duration {
-	// Stop advertising while the ESP is active.
-	adv.Stop()
-
+func handleESPSession() time.Duration {
 	// Two pins to handle various boards
 	pin_power := machine.P0_08
 	pin_power.Configure(machine.PinConfig{Mode: machine.PinOutput})
@@ -188,9 +126,6 @@ func handleESPSession(adv *bluetooth.Advertisement) time.Duration {
 	pin_power.Low()
 	pin_power_2.Low()
 	println("Power off")
-
-	// Resume advertising.
-	must("start adv", adv.Start())
 
 	if ok && pulses > 0 {
 		duration := time.Duration(pulses) * PULSE_UNIT
@@ -238,26 +173,12 @@ func main() {
 	led := machine.LED
 	led.Configure(machine.PinConfig{Mode: machine.PinOutput})
 
-	must("enable BLE stack", adapter.Enable())
-
-	// GATT services must be registered before advertising starts.
-	setupGATT()
-
-	adv := adapter.DefaultAdvertisement()
-	must("config adv", adv.Configure(advertisement_options))
-	must("start adv", adv.Start())
-
-	println("advertising...")
-	address, _ := adapter.Address()
-	println("Go Bluetooth /", address.MAC.String())
-
 	nextESPWakeup := time.Now()
 	for {
-		if triggerESP || !time.Now().Before(nextESPWakeup) {
-			triggerESP = false
+		if !time.Now().Before(nextESPWakeup) {
 			pin_3v3.High()
 			led.High()
-			sleepDuration := handleESPSession(adv)
+			sleepDuration := handleESPSession()
 			led.Low()
 			pin_3v3.Low()
 			println("Next ESP wakeup in", int(sleepDuration.Minutes()), "minute(s)")
@@ -266,10 +187,7 @@ func main() {
 
 		watchdog_keepalive()
 
-		must("config adv", adv.Configure(advertisement_options))
-		must("start adv", adv.Start())
 		time.Sleep(NRF_SLEEP_TIME)
-		adv.Stop()
 	}
 }
 
