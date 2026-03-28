@@ -5,6 +5,7 @@ import (
 	"time"
 	"device/nrf"
 	"tinygo.org/x/bluetooth"
+	"unsafe"
 )
 
 const NRF_SLEEP_TIME = 5 * time.Second
@@ -13,6 +14,10 @@ const ESP_TIMEOUT = 160 * time.Second
 
 // How long the pin must stay continuously low to be considered a valid sleep signal.
 const ESP_LOW_DURATION = 3 * time.Second
+
+// One pulse from the ESP encodes this many minutes of requested sleep.
+// Must match PULSE_UNIT_MINUTES in the Rust firmware.
+const PULSE_UNIT = 5 * time.Minute
 
 // Custom 128-bit UUIDs for the ESP trigger service.
 // Use these same UUIDs in nRF Connect to find the characteristic.
@@ -83,50 +88,76 @@ func startWatchdog(timeoutSeconds uint32) {
     nrf.WDT.TASKS_START.Set(1)
 }
 
-func waitForInterrupt(pin machine.Pin, lowDuration time.Duration, timeout time.Duration) bool {
+// decodeSignalPin reads the pulse-encoded sleep duration from the ESP.
+//
+// The ESP drives the pin through this sequence:
+//   1. N short pulses  (LOW for ~400 ms, HIGH for ~400 ms)  ← N = sleep_minutes / PULSE_UNIT
+//   2. Sustained LOW                                         ← "done, cut power"
+//
+// After each falling edge we measure how long the pin stays low:
+//   < ESP_LOW_DURATION  → it was a pulse; increment counter; wait for next edge
+//   ≥ ESP_LOW_DURATION  → it was the done signal; return the count
+//
+// Returns (pulseCount, true) on a clean done signal, or (0, false) on timeout.
+func decodeSignalPin(pin machine.Pin, timeout time.Duration) (int, bool) {
 	fallingEdge := false
 
 	pin.SetInterrupt(machine.PinFalling, func(p machine.Pin) {
-		println("Falling edge detected")
 		fallingEdge = true
 	})
+	defer pin.SetInterrupt(machine.PinFalling, nil)
 
 	deadline := time.Now().Add(timeout)
+	pulses := 0
 
 	for time.Now().Before(deadline) {
-		if fallingEdge {
-			fallingEdge = false
+		watchdog_keepalive()
+
+		if !fallingEdge {
 			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		fallingEdge = false
 
-			if !pin.Get() {
-				start := time.Now()
-				valid := true
+		// Debounce: wait a moment, then confirm the pin is actually low.
+		time.Sleep(10 * time.Millisecond)
+		if pin.Get() {
+			println("Spurious edge, ignoring")
+			continue
+		}
 
-				for time.Since(start) < lowDuration {
-					if pin.Get() {
-						valid = false
-						println("Pin went high again, ignoring edge")
-						break
-					}
-					time.Sleep(10 * time.Millisecond)
-				}
-
-				if valid {
-					// Pin stayed low for the full debounce duration
-					return true
-				}
+		// Measure how long the pin stays low.
+		lowSince := time.Now()
+		isDone := false
+		for time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+			if pin.Get() {
+				// Pin recovered — it was a pulse.
+				break
+			}
+			if time.Since(lowSince) >= ESP_LOW_DURATION {
+				// Pin has been low long enough — done signal.
+				isDone = true
+				break
 			}
 		}
 
-		time.Sleep(100 * time.Millisecond)
+		if isDone {
+			println("Done signal received after", pulses, "pulse(s)")
+			return pulses, true
+		}
+		pulses++
+		println("Pulse", pulses, "received")
+
+		// Pin is now high again; loop back to wait for the next falling edge.
 	}
 
-	// Timeout
-	return false
+	println("Timeout waiting for done signal")
+	return 0, false
 }
 
-func handleESPSession(adv *bluetooth.Advertisement) {
-	// Stop advertising while the ESP owns the I2C bus.
+func handleESPSession(adv *bluetooth.Advertisement) time.Duration {
+	// Stop advertising while the ESP is active.
 	adv.Stop()
 
 	// Two pins to handle various boards
@@ -144,32 +175,60 @@ func handleESPSession(adv *bluetooth.Advertisement) {
 
 	println("Waiting for ESP to assert signal pin high...")
 
-	// Wait for the ESP to assert the signal pin high before arming the interrupt
-
+	// Wait for the ESP to pull the signal pin high (signals boot complete)
+	// before we arm the edge interrupt, so we don't catch boot noise.
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) && !pin_sleep_signal.Get() {
 		time.Sleep(100 * time.Millisecond)
 	}
-	println("Signal pin is high and ESP has started, or reached timeout. Watching for falling edge...")
+	println("Signal pin high (or timeout). Decoding sleep duration...")
 
-	ok := waitForInterrupt(pin_sleep_signal, ESP_LOW_DURATION, ESP_TIMEOUT)
-	if ok {
-		println("Success: pin stayed low for required duration, ESP is done")
-	} else {
-		println("Timeout: ESP did not signal completion within", ESP_TIMEOUT)
-	}
+	pulses, ok := decodeSignalPin(pin_sleep_signal, ESP_TIMEOUT)
 
-	pin_sleep_signal.SetInterrupt(machine.PinFalling, nil)
 	pin_power.Low()
 	pin_power_2.Low()
 	println("Power off")
 
 	// Resume advertising.
 	must("start adv", adv.Start())
+
+	if ok && pulses > 0 {
+		duration := time.Duration(pulses) * PULSE_UNIT
+		println("Decoded sleep duration:", int(duration.Minutes()), "minute(s)")
+		return duration
+	}
+
+	if ok && pulses == 0 {
+		// Done signal received but no pulses — ESP may be running old firmware
+		// that drives the pin low without encoding a duration.  Keep the
+		// current default so behaviour is unchanged.
+		println("No pulses decoded (old firmware?), using default sleep duration")
+	} else {
+		println("Timeout, using default sleep duration")
+	}
+	return ESP_SLEEP_TIME
+}
+
+func clearBootloaderCrashFlag() {
+    // The UF2 bootloader stores its "double-tap" / crash flag at the start
+    // of retained RAM (0x20007F00 on nRF52840 with Adafruit bootloader).
+    // Writing 0 tells it "clean boot, reset the counter".
+    *(*uint32)(unsafe.Pointer(uintptr(0x20007F00))) = 0
+
+	// Tell the bootloader to skip the double-reset DFU window on the next boot.
+    // DFU_DBL_RESET_APP = 0x4ee5677e, stored at DFU_DBL_RESET_MEM = 0x20007F7C
+    // Source: adafruit/Adafruit_nRF52_Bootloader linker/nrf52840.ld + src/main.c
+    *(*uint32)(unsafe.Pointer(uintptr(0x20007F7C))) = 0x4ee5677e
 }
 
 func main() {
 	println("start")
+
+	time.Sleep(1 * time.Second)
+	clearBootloaderCrashFlag()
+
+	// enable POF, threshold ~2.7 V (V27 = 0b1010)
+	nrf.POWER.POFCON.Set((0b1010 << 1) | 1)
 
 	startWatchdog(uint32(ESP_TIMEOUT.Seconds()) + 30);
 
@@ -198,20 +257,25 @@ func main() {
 			triggerESP = false
 			pin_3v3.High()
 			led.High()
-			handleESPSession(adv)
+			sleepDuration := handleESPSession(adv)
 			led.Low()
 			pin_3v3.Low()
-			nextESPWakeup = time.Now().Add(ESP_SLEEP_TIME)
+			println("Next ESP wakeup in", int(sleepDuration.Minutes()), "minute(s)")
+			nextESPWakeup = time.Now().Add(sleepDuration)
 		}
 
-		// magic reload value, cf. https://docs.nordicsemi.com/bundle/ps_nrf5340/page/wdt.html
-		nrf.WDT.RR[0].Set(0x6E524635)
+		watchdog_keepalive()
 
 		must("config adv", adv.Configure(advertisement_options))
 		must("start adv", adv.Start())
 		time.Sleep(NRF_SLEEP_TIME)
 		adv.Stop()
 	}
+}
+
+func watchdog_keepalive() {
+	// magic reload value, cf. https://docs.nordicsemi.com/bundle/ps_nrf5340/page/wdt.html
+	nrf.WDT.RR[0].Set(0x6E524635)
 }
 
 func must(action string, err error) {
