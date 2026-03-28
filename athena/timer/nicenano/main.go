@@ -5,6 +5,7 @@ import (
 	"machine"
 	"time"
 	"device/nrf"
+	"unsafe"
 )
 
 const ESP_SLEEP_TIME = 60 * 30 * time.Second
@@ -43,17 +44,34 @@ func startWatchdog(timeoutSeconds uint32) {
 	nrf.WDT.TASKS_START.Set(1)
 }
 
+func watchdog_keepalive() {
+	// magic reload value, cf. https://docs.nordicsemi.com/bundle/ps_nrf5340/page/wdt.html
+	nrf.WDT.RR[0].Set(0x6E524635)
+}
+
+func clearBootloaderCrashFlag() {
+    // The UF2 bootloader stores its "double-tap" / crash flag at the start
+    // of retained RAM (0x20007F00 on nRF52840 with Adafruit bootloader).
+    // Writing 0 tells it "clean boot, reset the counter".
+    *(*uint32)(unsafe.Pointer(uintptr(0x20007F00))) = 0
+
+	// Tell the bootloader to skip the double-reset DFU window on the next boot.
+    // DFU_DBL_RESET_APP = 0x4ee5677e, stored at DFU_DBL_RESET_MEM = 0x20007F7C
+    // Source: adafruit/Adafruit_nRF52_Bootloader linker/nrf52840.ld + src/main.c
+    *(*uint32)(unsafe.Pointer(uintptr(0x20007F7C))) = 0x4ee5677e
+}
+
 // ---------------------------------------------------------------------------
 // I2C target receive
 // ---------------------------------------------------------------------------
 
-// listenForESPMessage configures I2C0 as a TWIS target and blocks until it
+// listenForI2CMessage configures I2C0 as a TWIS target and blocks until it
 // receives a valid 4-byte message from the ESP, or until the timeout fires.
 //
 // This works because the SoftDevice is never enabled (no bluetooth import),
 // so TWIS events are delivered directly to the application as on any bare-
 // metal nRF52840 target.
-func listenForESPMessage(timeout time.Duration) (time.Duration, bool) {
+func listenForI2CMessage(timeout time.Duration) (time.Duration, bool) {
 	err := machine.I2C0.Configure(machine.I2CConfig{
         Frequency: 400_000,
 		SCL:     machine.P0_17,
@@ -79,6 +97,8 @@ func listenForESPMessage(timeout time.Duration) (time.Duration, bool) {
 	// with: n, err := machine.I2C0.Listen(buf)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		watchdog_keepalive()
+
 		event, count, err := machine.I2C0.WaitForEvent(buf)
 		if err != nil {
 			println("I2C WaitForEvent error:", err.Error())
@@ -128,7 +148,7 @@ func handleESPSession() time.Duration {
 	pin_power.High()
 	pin_power_2.High()
 
-	sleepDuration, ok := listenForESPMessage(ESP_TIMEOUT)
+	sleepDuration, ok := listenForI2CMessage(ESP_TIMEOUT)
 
 	pin_power.Low()
 	pin_power_2.Low()
@@ -146,8 +166,13 @@ func handleESPSession() time.Duration {
 // ---------------------------------------------------------------------------
 
 func main() {
-    time.Sleep(5 * time.Second)
 	println("start")
+
+	time.Sleep(1 * time.Second)
+	clearBootloaderCrashFlag()
+
+	// enable POF, threshold ~2.7 V (V27 = 0b1010)
+	nrf.POWER.POFCON.Set((0b1010 << 1) | 1)
 
 	startWatchdog(uint32(ESP_TIMEOUT.Seconds()) + 30)
 
@@ -169,8 +194,7 @@ func main() {
 			nextESPWakeup = time.Now().Add(sleepDuration)
 		}
 
-		// Pet the watchdog.
-		nrf.WDT.RR[0].Set(0x6E524635)
+		watchdog_keepalive()
 
 		time.Sleep(5 * time.Second)
 	}
