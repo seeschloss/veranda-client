@@ -8,7 +8,7 @@ import (
 	"unsafe"
 )
 
-const ESP_SLEEP_TIME = 60 * 30 * time.Second
+const DEFAULT_ESP_SLEEP_TIME = 60 * 30 * time.Second
 const ESP_TIMEOUT = 160 * time.Second
 
 // I2C target configuration.
@@ -133,7 +133,7 @@ func listenForI2CMessage(timeout time.Duration) (time.Duration, bool) {
 // ---------------------------------------------------------------------------
 
 // handleESPSession powers on the ESP, waits for it to send the sleep duration
-// over I2C, then powers it off. Returns the decoded duration or ESP_SLEEP_TIME.
+// over I2C, then powers it off. Returns the decoded duration or DEFAULT_ESP_SLEEP_TIME.
 func handleESPSession() time.Duration {
 	pin_power := machine.P0_08
 	pin_power.Configure(machine.PinConfig{Mode: machine.PinOutput})
@@ -145,20 +145,38 @@ func handleESPSession() time.Duration {
 	// (The Configure call sets up the TWIS peripheral but does not block yet;
 	// WaitForEvent/Listen below is the blocking call.)
 	println("Arming I2C target, powering on ESP...")
-	pin_power.High()
+	pin_power.Low()
 	pin_power_2.High()
 
-	sleepDuration, ok := listenForI2CMessage(ESP_TIMEOUT)
+	sleep_duration := DEFAULT_ESP_SLEEP_TIME
 
-	pin_power.Low()
+	type result struct{
+		ok bool
+		sleep_duration time.Duration
+	}
+
+	res := make(chan result, 1)
+
+	go func() {
+		sleep_duration, ok := listenForI2CMessage(ESP_TIMEOUT)
+		res <- result{ok: ok, sleep_duration: sleep_duration}
+		close(res)
+	}()
+
+	select {
+	case res := <-res:
+		if res.ok {
+			sleep_duration = res.sleep_duration
+		}
+	case <-time.After(ESP_TIMEOUT):
+        println("I2C WaitForEvent timeout")
+	}
+
+	pin_power.High()
 	pin_power_2.Low()
 	println("ESP powered off")
 
-	if ok {
-		return sleepDuration
-	}
-	println("No valid I2C message, using default sleep duration")
-	return ESP_SLEEP_TIME
+	return sleep_duration
 }
 
 // ---------------------------------------------------------------------------
