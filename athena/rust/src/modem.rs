@@ -74,9 +74,6 @@ pub trait Modem {
     fn http_get(&mut self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse>;
     fn battery_voltage(&mut self) -> Result<f32>;
     fn signal_quality(&mut self) -> Result<i32>;
-    fn sleep(&mut self) -> Result<()>;
-    fn wake(&mut self) -> Result<()>;
-    fn is_connected(&self) -> bool;
 }
 
 // ---------------------------------------------------------------------------
@@ -112,8 +109,3 @@ pub fn parse_http_response_bytes(raw: &[u8]) -> HttpResponse {
     HttpResponse { status, headers, body }
 }
 
-/// Convenience wrapper for callers that already hold the response as `&str`.
-#[inline]
-pub fn parse_http_response(raw: &str) -> HttpResponse {
-    parse_http_response_bytes(raw.as_bytes())
-}

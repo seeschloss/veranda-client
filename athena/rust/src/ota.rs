@@ -30,18 +30,6 @@ pub fn install_firmware(firmware: &[u8], expected_sha256: &str) -> Result<()> {
     unsafe { esp_restart() };
 }
 
-pub fn parse_response_header(raw_response: &str, header_name: &str) -> Option<String> {
-    let header_section = raw_response.split("\r\n\r\n").next().unwrap_or(raw_response);
-    for line in header_section.lines() {
-        if let Some(rest) = line.strip_prefix(header_name) {
-            if let Some(value) = rest.strip_prefix(':') {
-                return Some(value.trim().to_string());
-            }
-        }
-    }
-    None
-}
-
 fn verify_sha256(data: &[u8], expected: &str) -> bool {
     let digest = Sha256::digest(data);
     if expected.len() != 64 {

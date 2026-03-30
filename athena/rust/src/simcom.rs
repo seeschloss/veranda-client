@@ -964,13 +964,4 @@ impl<'a> Modem for SimcomModule<'a> {
     fn battery_voltage(&mut self) -> Result<f32> {
         self.battery_voltage()
     }
-    fn sleep(&mut self) -> Result<()> {
-        self.sleep()
-    }
-    fn wake(&mut self) -> Result<()> {
-        self.wake()
-    }
-    fn is_connected(&self) -> bool {
-        self.is_connected()
-    }
 }

@@ -11,9 +11,10 @@ use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
 use log::*;
 use std::time::Duration;
 use std::thread;
+use std::sync::{Arc, Mutex};
+use embedded_hal_bus::i2c::MutexDevice;
 
 use core::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use ina3221::INA3221;
 
@@ -62,8 +63,11 @@ static FIRMWARE_BOARD_TAG: &[u8] =
 // Application constants
 // ---------------------------------------------------------------------------
 
-const SLEEP_MINUTES: u64 = 30;
 const INA3221_I2C_ADDR: u8 = 0x40;
+
+// I2C address of the nRF52840 acting as a target.  Must match the value
+// in the TinyGo firmware (i2cTargetAddr = 0x42).
+const NRF_I2C_ADDR: u8 = 0x42;
 
 const PHOTO_URL:       &str = "http://128.140.94.191/data/photo";
 const SENSOR_DATA_URL: &str = "http://128.140.94.191/data/sensor";
@@ -79,7 +83,7 @@ fn main() {
     info!("Athena booting up with version {}", FIRMWARE_VERSION);
     info!("Version tags are: {:?} {:?} {:?}", FIRMWARE_VERSION_TAG, FIRMWARE_MODEM_TAG, FIRMWARE_BOARD_TAG);
 
-    let (jpeg_quality, brightness_threshold) = load_config();
+    let (jpeg_quality, brightness_threshold, sleep_minutes) = load_config();
 
     // ── Internal temperature sensor ─────────────────────────────────────────
     let mut temp_sensor: temperature_sensor_handle_t = std::ptr::null_mut();
@@ -96,6 +100,15 @@ fn main() {
         temperature_sensor_get_celsius(temp_sensor, &mut esp32_temp);
     }
 
+    // ── GPIO: sleep signal and LED ───────────────────────────────────────────
+    let mut sleep_signal_pin = board::pin(board::pins::SLEEP_SIGNAL)
+        .and_then(|p| PinDriver::output(p).ok());
+
+    if let Some(ref mut pin) = sleep_signal_pin {
+        info!("Setting sleep signal high.");
+        let _ = pin.set_high();
+    }
+
     // ── Shared power telemetry ───────────────────────────────────────────────
     let power_data     = Arc::new(power::PowerData::default());
     let task_running   = Arc::new(AtomicBool::new(true));
@@ -110,15 +123,7 @@ fn main() {
         }
     };
 
-    // ── GPIO: sleep signal and LED ───────────────────────────────────────────
-    let mut sleep_signal_pin = board::pin(board::pins::SLEEP_SIGNAL)
-        .and_then(|p| PinDriver::output(p).ok());
-
-    if let Some(ref mut pin) = sleep_signal_pin {
-        info!("Setting sleep signal high.");
-        let _ = pin.set_high();
-    }
-
+    // ── LED ──────────────────────────────────────────────────────────────────
     let mut led_pin = board::pin(board::pins::LED)
         .and_then(|p| PinDriver::output(p).ok());
 
@@ -126,27 +131,39 @@ fn main() {
         let _ = pin.set_low();
     }
 
-    // ── INA3221 power monitor ────────────────────────────────────────────────
-    let i2c = if let (Some(sda), Some(scl)) = (
-        board::pin(board::pins::I2C_SDA),
-        board::pin(board::pins::I2C_SCL),
-    ) {
-        if let Ok(i2c) = I2cDriver::new(
-            peripherals.i2c0,
-            sda, scl,
-            &i2c::I2cConfig::new().baudrate(Hertz(400_000)),
+    // ── Shared I2C bus (i2c0) ────────────────────────────────────────────────
+    // We share the bus between the INA3221 monitoring task (core 1) and the
+    // main task (nRF notification).  `embedded-hal-bus` provides `MutexDevice`
+    // exactly for this purpose — no hand-rolled wrapper needed.
+    //
+    // We need a `&'static Mutex<I2cDriver>` so the reference can be sent into
+    // the FreeRTOS task.  `Box::leak` is the idiomatic way to get a 'static
+    // reference from a heap allocation whose owner deliberately gives up
+    // control for the lifetime of the program.  No `unsafe transmute` needed.
+    let i2c_bus: Option<&'static Mutex<I2cDriver>> =
+        if let (Some(sda), Some(scl)) = (
+            board::pin(board::pins::I2C_SDA),
+            board::pin(board::pins::I2C_SCL),
         ) {
-            Some(i2c)
+            match I2cDriver::new(
+                peripherals.i2c0,
+                sda, scl,
+                &i2c::I2cConfig::new().baudrate(Hertz(400_000)),
+            ) {
+                Ok(drv) => Some(Box::leak(Box::new(Mutex::new(drv)))),
+                Err(e) => {
+                    warn!("Failed to init shared I2C bus: {:?}", e);
+                    None
+                }
+            }
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
 
-    if let Some(i2c) = i2c {
+    // Give the monitoring task a `MutexDevice` view of the shared bus.
+    if let Some(bus) = i2c_bus {
         power::spawn_monitoring_task(
-            INA3221::new(i2c, INA3221_I2C_ADDR),
+            INA3221::new(MutexDevice::new(bus), INA3221_I2C_ADDR),
             power_data.clone(),
             task_running.clone(),
         );
@@ -229,7 +246,6 @@ fn main() {
     loop {
         let (image_data, brightness) = match camera {
             Some(ref cam) => {
-                // Take a few pictures the let the camera's auto-exposition settle
                 info!("Taking 10 frames over 2,5 seconds to let auto-exposure adjust");
                 for _loop in 1..10 {
                     if let Some(frame) = cam.get_framebuffer() {
@@ -273,7 +289,6 @@ fn main() {
             });
             info!("Signal quality: {} dBm", signal_quality);
 
-            // ── Sensor data POST ─────────────────────────────────
             let json_data = build_sensor_json(
                 &power_data, modem_voltage, image_data.map_or_else(|| 0, |d| d.len()), esp32_temp, signal_quality
             );
@@ -281,7 +296,7 @@ fn main() {
 
             match modem.http_post(SENSOR_DATA_URL, json_data.as_bytes(), &headers) {
                 Ok(resp) => {
-                    handle_config_response(&resp, jpeg_quality, brightness_threshold);
+                    handle_config_response(&resp, jpeg_quality, brightness_threshold, sleep_minutes);
                     handle_ota_response(&resp, &mac_string, modem);
                 }
                 Err(e) => warn!("Sensor data POST failed: {:?}", e),
@@ -301,7 +316,6 @@ fn main() {
                 info!("No photo to upload");
             }
 
-            // ── Post-send energy summary ──────────────────────────
             let energy_json = format!(
                 "{{\"brightness\":{{\"type\":\"brightness\",\"value\":{}}},\
                   \"battery\":{{\"type\":\"voltage\",\"value\":{:.3}}},\
@@ -318,27 +332,61 @@ fn main() {
             info!("Power data: {:?}", power_data);
         }
 
-        info!("Sleeping for {} minute(s).", SLEEP_MINUTES);
+        info!("Sleeping for {} minute(s).", sleep_minutes);
 
         if let Some(ref mut pin) = led_pin {
             let _ = pin.set_high();
         }
+
+        // ── Notify nRF of requested sleep duration, then power down ──────────
+        // Lock the shared bus directly — MutexDevice (used by the monitoring
+        // task) and this lock() call use the same underlying Mutex, so they
+        // cannot overlap.
+        if let Some(bus) = i2c_bus {
+            let mut drv = bus.lock().expect("I2C mutex poisoned");
+            notify_nrf(&mut *drv, sleep_minutes);
+            thread::sleep(Duration::from_millis(500));
+        }
+
+        // In case the I2C signal doesn't work, or the board runs with an old version
+        // of the nRF52840 firmware, or whatever, just set that signal as well.
         if let Some(ref mut pin) = sleep_signal_pin {
             info!("Setting sleep signal low.");
             let _ = pin.set_low();
         }
 
         task_running.store(false, Ordering::SeqCst);
-        thread::sleep(Duration::from_millis(100));
-        thread::sleep(Duration::from_secs(60 * SLEEP_MINUTES));
+        thread::sleep(Duration::from_secs(60 * sleep_minutes as u64));
     }
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// nRF sleep notification
 // ---------------------------------------------------------------------------
 
-/// Build common request headers, with `content_type` as the Content-Type value.
+/// Sends the next sleep duration to the nRF52840 over I2C.
+///
+/// Protocol (4 bytes, big-endian):
+///   [0xAE, 0xBE, seconds_hi, seconds_lo]
+///
+/// 0xAE 0xBE are magic bytes the nRF checks before trusting the payload.
+/// The duration is encoded as a u16 (seconds), capped at 65535 s (~18 h).
+fn notify_nrf<I>(i2c: &mut I, sleep_minutes: u32)
+where
+    I: embedded_hal::i2c::I2c,
+{
+    let secs = (sleep_minutes * 60).min(u16::MAX as u32) as u16;
+    let payload = [0x17_u8, 0x89, (secs >> 8) as u8, secs as u8];
+    match i2c.write(NRF_I2C_ADDR, &payload) {
+        Ok(_)  => info!("Notified nRF: sleep {} min ({} s).", sleep_minutes, secs),
+        Err(e) => warn!("Failed to notify nRF over I2C: {:?}", e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers (unchanged)
+// ---------------------------------------------------------------------------
+
 fn build_headers<'a>(mac: &'a str, content_type: &'a str) -> [(&'a str, &'a str); 5] {
     [
         ("Content-Type",      content_type),
@@ -349,7 +397,6 @@ fn build_headers<'a>(mac: &'a str, content_type: &'a str) -> [(&'a str, &'a str)
     ]
 }
 
-/// Serialise current power measurements to the server's JSON format.
 fn build_sensor_json(
     pd:          &power::PowerData,
     modem_v:     f32,
@@ -381,10 +428,10 @@ fn build_sensor_json(
     )
 }
 
-/// Reads settings from NVRAM
-fn load_config() -> (i32, u32) {
+fn load_config() -> (i32, u32, u32) {
     let mut jpeg_quality = 5;
     let mut brightness_threshold = 10;
+    let mut sleep_minutes = 30;
 
     if let Ok(nvs_partition) = EspDefaultNvsPartition::take() {
         if let Ok(nvs) = EspNvs::new(nvs_partition, "athena", true) {
@@ -393,14 +440,16 @@ fn load_config() -> (i32, u32) {
 
             brightness_threshold = nvs.get_u32("rightn_thr").unwrap_or(None).unwrap_or(10);
             info!("Brightness threshold loaded from config: {}", brightness_threshold);
+
+            sleep_minutes = nvs.get_u32("sleep_minutes").unwrap_or(None).unwrap_or(30);
+            info!("Sleep time loaded from config: {}", sleep_minutes);
         }
     }
 
-    (jpeg_quality, brightness_threshold)
+    (jpeg_quality, brightness_threshold, sleep_minutes)
 }
 
-/// Stores settings into NVRAM
-fn handle_config_response(resp: &modem::HttpResponse, jpeg_quality_current: i32, brightness_threshold_current: u32) {
+fn handle_config_response(resp: &modem::HttpResponse, jpeg_quality_current: i32, brightness_threshold_current: u32, sleep_minutes_current: u32) {
     if let Ok(nvs_partition) = EspDefaultNvsPartition::take() {
         if let Ok(nvs) = EspNvs::new(nvs_partition, "athena", true) {
             if let Some(jpeg_quality_new) = resp.header("X-Jpeg-Quality") {
@@ -418,11 +467,18 @@ fn handle_config_response(resp: &modem::HttpResponse, jpeg_quality_current: i32,
                     info!("Brightness threshold saved from response: {}", brightness_threshold_parsed);
                 }
             }
+
+            if let Some(sleep_minutes_new) = resp.header("X-Sleep-Minutes") {
+                let sleep_minutes_parsed = sleep_minutes_new.parse::<u32>().unwrap_or(10);
+                if sleep_minutes_parsed != sleep_minutes_current {
+                    let _ = nvs.set_u32("sleep_minutes", sleep_minutes_parsed);
+                    info!("Sleep time saved from response: {}", sleep_minutes_parsed);
+                }
+            }
         }
     }
 }
 
-/// Check the sensor-data POST response for an OTA update directive and apply it.
 fn handle_ota_response(resp: &modem::HttpResponse, mac: &str, modem: &mut Box<dyn modem::Modem>) {
     if let (Some(fw_url), Some(fw_sha256), Some(fw_version)) = (
         resp.header("X-Firmware-Update"),

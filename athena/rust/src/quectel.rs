@@ -827,7 +827,4 @@ impl<'a> Modem for QuectelModule<'a> {
     fn http_get(&mut self, url: &str, h: &[(&str, &str)])    -> Result<HttpResponse> { self.http_get(url, h) }
     fn battery_voltage(&mut self)                            -> Result<f32>          { self.battery_voltage() }
     fn signal_quality(&mut self)                             -> Result<i32>          { self.signal_quality() }
-    fn sleep(&mut self)                                      -> Result<()>           { self.sleep() }
-    fn wake(&mut self)                                       -> Result<()>           { self.wake() }
-    fn is_connected(&self)                                   -> bool                 { self.is_connected() }
 }
