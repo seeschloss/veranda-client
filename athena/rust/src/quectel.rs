@@ -24,6 +24,8 @@ use std::thread;
 
 use crate::modem::{Modem, HttpResponse, ModemError, parse_http_response_bytes};
 
+use chrono::NaiveDateTime;
+
 // ---------------------------------------------------------------------------
 // Driver struct
 // ---------------------------------------------------------------------------
@@ -175,7 +177,7 @@ impl<'a> QuectelModule<'a> {
         command:  &str,
         expected: &str,
         timeout:  Duration,
-        tries:    i32,
+        tries:    u32,
     ) -> Result<String, ModemError> {
         let mut remaining = tries;
         let mut last_err  = ModemError::new("no attempts made");
@@ -209,7 +211,7 @@ impl<'a> QuectelModule<'a> {
     ) -> Result<String> {
         let start    = std::time::Instant::now();
         let mut resp = String::new();
-        let mut buf  = [0u8; 256];
+        let mut buf = [0u8; 256];
 
         while start.elapsed() < timeout {
             match self.uart.read(&mut buf, 100) {
@@ -368,6 +370,24 @@ impl<'a> QuectelModule<'a> {
         Err(anyhow!("No +CBC: field in response: {}", resp))
     }
 
+    /// Read network time from `AT+QLTS`.
+    pub fn network_time(&mut self) -> Result<NaiveDateTime> {
+        let resp = self.send_at_command("AT+QLTS", "OK", Duration::from_millis(300))
+            .map_err(|e| anyhow!("AT+QLTS failed: {}", e))?;
+
+        if let Some(pos) = resp.find("+QLTS:") {
+            let datetime_response_str = resp[pos + 8..].trim_start();
+            let datetime_str = &datetime_response_str[.. 19];
+            if let Ok(date) = NaiveDateTime::parse_from_str(datetime_str, "%Y/%m/%d,%H:%M:%S") {
+                return Ok(date);
+            } else {
+                return Err(anyhow!("Could not parse date: {} ({})", resp, datetime_str));
+            }
+        }
+
+        Err(anyhow!("Could not retrieve date: {}", resp))
+    }
+
     // -----------------------------------------------------------------------
     // Network initialisation
     // -----------------------------------------------------------------------
@@ -382,28 +402,27 @@ impl<'a> QuectelModule<'a> {
     ///   5. Configure PDP context (APN)
     ///   6. Activate PDP context (AT+CGACT) and Quectel socket layer (AT+QIACT)
     ///   7. Confirm IP address assigned
-    pub fn initialize_network(&mut self, apn: &str) -> Result<()> {
+    pub fn initialize_network(&mut self, apn: &str, powerup_timeout: Duration, connect_timeout: Duration) -> Result<()> {
         self.detect_and_set_uart_speed(Hertz(230400))?;
 
         info!("Initialising network connection...");
 
         // 1. Confirm AT
-        self.send_at_command_until("AT", "OK", Duration::from_secs(5), 30)?;
+        self.send_at_command_until("AT", "OK", Duration::from_secs(5), (powerup_timeout.as_secs() / 5) as u32)?;
 
-        // Disable echo (belt-and-braces after detect_and_set_uart_speed)
         let _ = self.send_at_command("ATE0", "OK", Duration::from_secs(2));
 
         // 2. SIM ready
-        self.wait_for_sim_ready(Duration::from_secs(30))?;
+        self.wait_for_sim_ready(Duration::from_secs(10))?;
 
         // 3. Network registration
-        self.send_at_command("AT+CREG=1",  "OK", Duration::from_secs(5))?;
-        self.send_at_command("AT+CGREG=1", "OK", Duration::from_secs(5))?;
-        self.send_at_command("AT+CEREG=1", "OK", Duration::from_secs(5))?;
-        self.wait_for_network_registration(Duration::from_secs(90))?;
+        let _ = self.send_at_command("AT+CREG=1",  "OK", Duration::from_secs(1));
+        let _ = self.send_at_command("AT+CGREG=1", "OK", Duration::from_secs(1));
+        let _ = self.send_at_command("AT+CEREG=1", "OK", Duration::from_secs(1));
+        self.wait_for_network_registration(connect_timeout)?;
 
         // 4. Signal quality
-        self.wait_for_signal(Duration::from_secs(30))?;
+        self.wait_for_signal(Duration::from_secs(5))?;
 
         // 5. PDP context
         let pdp_cmd = format!("AT+CGDCONT=1,\"IP\",\"{}\"", apn);
@@ -563,7 +582,7 @@ impl<'a> QuectelModule<'a> {
         self.send_at_command(&connect_cmd, "OK", Duration::from_secs(10))?;
 
         // Wait for async +QIOPEN URC and check error code.
-        let urc = self.wait_for_response("+QIOPEN:", Duration::from_secs(150), false)?;
+        let urc = self.wait_for_response("+QIOPEN:", Duration::from_secs(10), false)?;
 
         if let Some(pos) = urc.find("+QIOPEN:") {
             let after = urc[pos + 8..].trim_start();
@@ -596,11 +615,19 @@ impl<'a> QuectelModule<'a> {
     /// on failure (the data is resent from scratch, not resumed mid-send).
     pub fn send_tcp_data(&mut self, socket_id: u8, data: &[u8], retries: u8) -> Result<()> {
         let cmd = format!("AT+QISEND={},{}", socket_id, data.len());
-        self.send_at_command_silent(&cmd, ">", Duration::from_secs(5))?;
+        let result = self.send_at_command(&cmd, ">", Duration::from_secs(5));
+        if let Err(e) = result {
+            info!("{} failed? retrying ({} left): {}", cmd, retries, e);
+            if retries > 0 {
+                return self.send_tcp_data(socket_id, data, retries - 1);
+            } else {
+                return Err(e);
+            }
+        }
         self.uart.write(data)?;
 
         if let Err(e) = self.wait_for_response("SEND OK", Duration::from_secs(10), true) {
-            let _ = self.send_at_command_silent("AT+QIGETERROR", "OK", Duration::from_secs(1));
+            let _ = self.send_at_command("AT+QIGETERROR", "OK", Duration::from_secs(1));
             if retries > 0 {
                 info!("send_tcp_data failed, retrying ({} left): {}", retries, e);
                 thread::sleep(Duration::from_millis(1000));
@@ -822,9 +849,22 @@ impl<'a> QuectelModule<'a> {
 // ---------------------------------------------------------------------------
 
 impl<'a> Modem for QuectelModule<'a> {
-    fn initialize_network(&mut self, apn: &str)              -> Result<()>           { self.initialize_network(apn) }
-    fn http_post(&mut self, url: &str, body: &[u8], h: &[(&str, &str)]) -> Result<HttpResponse> { self.http_post(url, body, h) }
-    fn http_get(&mut self, url: &str, h: &[(&str, &str)])    -> Result<HttpResponse> { self.http_get(url, h) }
-    fn battery_voltage(&mut self)                            -> Result<f32>          { self.battery_voltage() }
-    fn signal_quality(&mut self)                             -> Result<i32>          { self.signal_quality() }
+    fn initialize_network(&mut self, apn: &str, powerup_timeout: Duration, connect_timeout: Duration) -> Result<()> {
+        self.initialize_network(apn, powerup_timeout, connect_timeout)
+    }
+    fn http_post(&mut self, url: &str, body: &[u8], headers: &[(&str, &str)]) -> Result<HttpResponse> {
+        self.http_post(url, body, headers)
+    }
+    fn http_get(&mut self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse> {
+        self.http_get(url, headers)
+    }
+    fn signal_quality(&mut self) -> Result<i32> {
+        self.signal_quality()
+    }
+    fn battery_voltage(&mut self) -> Result<f32> {
+        self.battery_voltage()
+    }
+    fn network_time(&mut self) -> Result<NaiveDateTime> {
+        self.network_time()
+    }
 }

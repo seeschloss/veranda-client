@@ -4,6 +4,8 @@
 //! `main.rs` to hold a `Box<dyn Modem>` regardless of the hardware fitted.
 
 use anyhow::Result;
+use chrono::NaiveDateTime;
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Shared error type  ← three design options described below
@@ -69,11 +71,12 @@ impl HttpResponse {
 // ---------------------------------------------------------------------------
 
 pub trait Modem {
-    fn initialize_network(&mut self, apn: &str) -> Result<()>;
+    fn initialize_network(&mut self, apn: &str, powerup_timeout: Duration, connect_timeout: Duration) -> Result<()>;
     fn http_post(&mut self, url: &str, body: &[u8], headers: &[(&str, &str)]) -> Result<HttpResponse>;
     fn http_get(&mut self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse>;
     fn battery_voltage(&mut self) -> Result<f32>;
     fn signal_quality(&mut self) -> Result<i32>;
+    fn network_time(&mut self) -> Result<NaiveDateTime>;
 }
 
 // ---------------------------------------------------------------------------

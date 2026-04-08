@@ -8,8 +8,10 @@ import (
 	"unsafe"
 )
 
-const DEFAULT_ESP_SLEEP_TIME = 60 * 30 * time.Second
-const ESP_TIMEOUT = 160 * time.Second
+// Short enough because it means the ESP could not connect, so let's
+// try again without waiting too much.
+const DEFAULT_ESP_SLEEP_TIME = 60 * 10 * time.Second
+const ESP_TIMEOUT = 240 * time.Second
 
 // I2C target configuration.
 //
@@ -47,18 +49,6 @@ func startWatchdog(timeoutSeconds uint32) {
 func watchdog_keepalive() {
 	// magic reload value, cf. https://docs.nordicsemi.com/bundle/ps_nrf5340/page/wdt.html
 	nrf.WDT.RR[0].Set(0x6E524635)
-}
-
-func clearBootloaderCrashFlag() {
-    // The UF2 bootloader stores its "double-tap" / crash flag at the start
-    // of retained RAM (0x20007F00 on nRF52840 with Adafruit bootloader).
-    // Writing 0 tells it "clean boot, reset the counter".
-    *(*uint32)(unsafe.Pointer(uintptr(0x20007F00))) = 0
-
-	// Tell the bootloader to skip the double-reset DFU window on the next boot.
-    // DFU_DBL_RESET_APP = 0x4ee5677e, stored at DFU_DBL_RESET_MEM = 0x20007F7C
-    // Source: adafruit/Adafruit_nRF52_Bootloader linker/nrf52840.ld + src/main.c
-    *(*uint32)(unsafe.Pointer(uintptr(0x20007F7C))) = 0x4ee5677e
 }
 
 // ---------------------------------------------------------------------------
@@ -141,12 +131,16 @@ func handleESPSession() time.Duration {
 	pin_power_2 := machine.P0_11
 	pin_power_2.Configure(machine.PinConfig{Mode: machine.PinOutput})
 
+	pin_power_3 := machine.P1_11
+	pin_power_3.Configure(machine.PinConfig{Mode: machine.PinOutput})
+
 	// Arm I2C target BEFORE powering on the ESP so no message can be missed.
 	// (The Configure call sets up the TWIS peripheral but does not block yet;
 	// WaitForEvent/Listen below is the blocking call.)
 	println("Arming I2C target, powering on ESP...")
-	pin_power.Low()
+	pin_power.High()
 	pin_power_2.High()
+	pin_power_3.High()
 
 	sleep_duration := DEFAULT_ESP_SLEEP_TIME
 
@@ -172,8 +166,9 @@ func handleESPSession() time.Duration {
         println("I2C WaitForEvent timeout")
 	}
 
-	pin_power.High()
+	pin_power.Low()
 	pin_power_2.Low()
+	pin_power_3.Low()
 	println("ESP powered off")
 
 	return sleep_duration
@@ -187,7 +182,15 @@ func main() {
 	println("start")
 
 	time.Sleep(1 * time.Second)
-	clearBootloaderCrashFlag()
+
+	// Tell the bootloader to skip the double-reset DFU window on the next boot.
+    // DFU_DBL_RESET_APP = 0x4ee5677e, stored at DFU_DBL_RESET_MEM = 0x20007F7C
+    // Source: adafruit/Adafruit_nRF52_Bootloader src/main.c
+    *(*uint32)(unsafe.Pointer(uintptr(0x20007F7C))) = 0x4ee5677e
+
+	// Set GPREGRET to DFU_MAGIC_SKIP. It's supposed to tell the nRF to skip DFU
+	// mode entirely. Hopefully I can still trigger it somehow.
+	nrf.POWER.GPREGRET.Set(0x6d)
 
 	// enable POF, threshold ~2.7 V (V27 = 0b1010)
 	nrf.POWER.POFCON.Set((0b1010 << 1) | 1)

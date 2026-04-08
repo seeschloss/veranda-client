@@ -1,5 +1,6 @@
 # Rust often needs a bit of extra stack space (the default is 3K)
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8000
+#CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
 
 # Use this to set FreeRTOS kernel tick frequency to 1000 Hz (100 Hz by default).
 # This allows to use 1 ms granuality for thread sleeps (10 ms by default).
@@ -29,6 +30,7 @@ CONFIG_CAMERA_PSRAM_DMA=n
 
 # Increase partition size for larger binaries
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 #CONFIG_PARTITION_TABLE_CUSTOM=y
 #CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 

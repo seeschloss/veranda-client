@@ -41,12 +41,12 @@ pub mod pins {
 pub mod pins {
     pub const SLEEP_SIGNAL: u8 = 0;
     pub const LED: u8 = 2;
-    pub const I2C_SDA: u8 = 48;
-    pub const I2C_SCL: u8 = 45;
-    pub const GSM_TX: u8 = 21;
-    pub const GSM_RX: u8 = 47;
-    pub const GSM_PWR: u8 = 0;
-    pub const GSM_SLP: u8 = 0;
+    pub const I2C_SDA: u8 = 39;
+    pub const I2C_SCL: u8 = 38;
+    pub const GSM_TX: u8 = 42;
+    pub const GSM_RX: u8 = 40;
+    pub const GSM_PWR: u8 = 41;
+    pub const GSM_SLP: u8 = 21;
     pub const CAM_XCLK:  u8 = 15;
     pub const CAM_SDA:   u8 = 4;
     pub const CAM_SCL:   u8 = 5;

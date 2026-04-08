@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use embedded_svc::http::client::Client;
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
@@ -10,6 +10,8 @@ use log::info;
 use std::io::Read;
 
 use crate::modem::{HttpResponse, Modem};
+
+use chrono::NaiveDateTime;
 
 #[used]
 #[no_mangle]
@@ -145,33 +147,22 @@ impl WifiModem {
 
 impl Modem for WifiModem {
     /// For WiFi there is no APN to configure, so this is a no-op.
-    /// If the connection has dropped, reconnection should be handled
-    /// outside (or extended here) — good enough for a debug helper.
-    fn initialize_network(&mut self, _apn: &str) -> Result<()> {
+    fn initialize_network(&mut self, _apn: &str, _powerup_timeout: Duration, _connect_timeout: Duration) -> Result<()> {
         Ok(())
     }
-
     fn http_post(&mut self, url: &str, body: &[u8], headers: &[(&str, &str)]) -> Result<HttpResponse> {
         self.send_request(embedded_svc::http::Method::Post, url, headers, Some(body))
     }
-
     fn http_get(&mut self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse> {
         self.send_request(embedded_svc::http::Method::Get, url, headers, None)
     }
-
+    fn signal_quality(&mut self) -> Result<i32> {
+        Err(anyhow!("Not available on WiFi"))
+    }
     fn battery_voltage(&mut self) -> Result<f32> {
-        bail!("battery_voltage not available on WiFi modem")
+        Err(anyhow!("Not available on WiFi"))
     }
-
-    fn sleep(&mut self) -> Result<()> {
-        Ok(()) // no-op: WiFi power management is handled by the IDF automatically
-    }
-
-    fn wake(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn is_connected(&self) -> bool {
-        true // if construction succeeded the IDF maintains the connection
+    fn network_time(&mut self) -> Result<NaiveDateTime> {
+        Err(anyhow!("Not available on WiFi"))
     }
 }

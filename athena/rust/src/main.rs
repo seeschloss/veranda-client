@@ -6,7 +6,6 @@ use esp_idf_hal::{
     units::Hertz,
 };
 use esp_idf_sys::{self as _, *};
-use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
 use log::*;
 use std::time::Duration;
@@ -16,13 +15,19 @@ use embedded_hal_bus::i2c::MutexDevice;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use chrono::NaiveDateTime;
+
 use ina3221::INA3221;
+
+#[cfg(feature = "modem-wifi")]
+use esp_idf_svc::eventloop::EspSystemEventLoop;
 
 mod board;
 mod camera;
 mod modem;
 mod ota;
 mod power;
+mod logger;
 
 #[cfg(feature = "modem-wifi")]
 mod wifi;
@@ -71,6 +76,7 @@ const NRF_I2C_ADDR: u8 = 0x42;
 
 const PHOTO_URL:       &str = "http://128.140.94.191/data/photo";
 const SENSOR_DATA_URL: &str = "http://128.140.94.191/data/sensor";
+const LOG_URL:         &str = "http://128.140.94.191/data/log";
 
 // ---------------------------------------------------------------------------
 // Main
@@ -78,10 +84,25 @@ const SENSOR_DATA_URL: &str = "http://128.140.94.191/data/sensor";
 
 fn main() {
     esp_idf_sys::link_patches();
-    esp_idf_svc::log::EspLogger::initialize_default();
+
+    let log_state = Arc::new(Mutex::new(logger::LogState {
+        network_time: None,
+        boot_time_us: 0,
+    }));
+
+    let log_buffer: &'static logger::LogBuffer = Box::leak(Box::new(logger::LogBuffer::new(500, log_state.clone())));
+    if let Err(e) = log::set_logger(log_buffer) {
+        println!("Logger error: {}", e);
+    }
+    log::set_max_level(log::LevelFilter::Info);
 
     info!("Athena booting up with version {}", FIRMWARE_VERSION);
-    info!("Version tags are: {:?} {:?} {:?}", FIRMWARE_VERSION_TAG, FIRMWARE_MODEM_TAG, FIRMWARE_BOARD_TAG);
+
+    info!("Version tags are: {} / {} / {}",
+        String::from_utf8_lossy(FIRMWARE_VERSION_TAG),
+        String::from_utf8_lossy(FIRMWARE_MODEM_TAG),
+        String::from_utf8_lossy(FIRMWARE_BOARD_TAG)
+    );
 
     let (jpeg_quality, brightness_threshold, sleep_minutes) = load_config();
 
@@ -150,25 +171,35 @@ fn main() {
                 sda, scl,
                 &i2c::I2cConfig::new().baudrate(Hertz(400_000)),
             ) {
-                Ok(drv) => Some(Box::leak(Box::new(Mutex::new(drv)))),
+                Ok(drv) => {
+                    info!("I2C bus initialized");
+                    Some(Box::leak(Box::new(Mutex::new(drv))))
+                },
                 Err(e) => {
                     warn!("Failed to init shared I2C bus: {:?}", e);
                     None
                 }
             }
         } else {
+            warn!("Failed to init I2C bus: pins not defined");
             None
         };
 
     // Give the monitoring task a `MutexDevice` view of the shared bus.
     if let Some(bus) = i2c_bus {
+        info!("Spawning monitoring task");
         power::spawn_monitoring_task(
             INA3221::new(MutexDevice::new(bus), INA3221_I2C_ADDR),
             power_data.clone(),
             task_running.clone(),
         );
+    } else {
+        info!("No I2C bus available, power will not be monitored");
     }
 
+    let mut gsm_module: Option<Box<dyn modem::Modem>> = None;
+
+    #[cfg(feature = "modem-wifi")]
     // ── ESP event loop (needed for WiFi) ─────────────────────────────────────
     let _sysloop = match EspSystemEventLoop::take() {
         Ok(s) => s,
@@ -178,9 +209,6 @@ fn main() {
             unsafe { esp_idf_sys::esp_restart(); }
         }
     };
-
-    // ── Modem ────────────────────────────────────────────────────────────────
-    let mut gsm_module: Option<Box<dyn modem::Modem>> = None;
 
     #[cfg(feature = "modem-wifi")]
     let mut gsm_module: Option<Box<dyn modem::Modem>> = {
@@ -231,8 +259,10 @@ fn main() {
         warn!("Not all GSM pins are configured for this board.");
     }
 
+    info!("Power data: {:?}", power_data);
+
     // ── Camera ───────────────────────────────────────────────────────────────
-    let camera = camera::init(jpeg_quality);
+    let camera = camera::init(19);
 
     // ── Device identity (MAC address) ────────────────────────────────────────
     let mac_string = unsafe {
@@ -273,8 +303,24 @@ fn main() {
         };
 
         if let Some(ref mut modem) = gsm_module {
-            if let Err(e) = modem.initialize_network("simbase") {
+            if let Err(e) = modem.initialize_network(
+                    "simbase",
+                    Duration::from_secs(30),
+                    Duration::from_secs(120)
+                ) {
                 info!("Network init: {:?} (may already be up)", e);
+            }
+
+            let network_time = modem.network_time().unwrap_or_else(|e| {
+                warn!("Network time unavailable: {}", e);
+                NaiveDateTime::default()
+            });
+            info!("Network time: {}", network_time);
+
+            // Update the logger state
+            if let Ok(mut state) = log_buffer.state.lock() {
+                state.network_time = Some(network_time);
+                state.boot_time_us = unsafe { esp_idf_sys::esp_timer_get_time() };
             }
 
             let modem_voltage = modem.battery_voltage().unwrap_or_else(|e| {
@@ -330,6 +376,14 @@ fn main() {
             }
 
             info!("Power data: {:?}", power_data);
+
+            let log_lines = log_buffer.drain();
+
+            let log_body = log_lines.join("\n");
+            let log_headers = build_headers(&mac_string, "text/plain");
+            if let Err(e) = modem.http_post(LOG_URL, log_body.as_bytes(), &log_headers) {
+                // can't log this failure without recursing, just ignore
+            }
         }
 
         info!("Sleeping for {} minute(s).", sleep_minutes);
@@ -343,9 +397,12 @@ fn main() {
         // task) and this lock() call use the same underlying Mutex, so they
         // cannot overlap.
         if let Some(bus) = i2c_bus {
+            info!("Notifying nRF to sleep for {} minutes", sleep_minutes);
             let mut drv = bus.lock().expect("I2C mutex poisoned");
             notify_nrf(&mut *drv, sleep_minutes);
             thread::sleep(Duration::from_millis(500));
+        } else {
+            info!("No I2C bus available, will not use I2C to notify nRF sleep duration");
         }
 
         // In case the I2C signal doesn't work, or the board runs with an old version

@@ -15,6 +15,8 @@ use std::thread;
 // see the comment in modem.rs.
 use crate::modem::ModemError as SimcomError;
 
+use chrono::NaiveDateTime;
+
 // ---------------------------------------------------------------------------
 // Main driver struct
 // ---------------------------------------------------------------------------
@@ -198,7 +200,7 @@ impl<'a> SimcomModule<'a> {
         command: &str,
         expected: &str,
         timeout: Duration,
-        tries: i32,
+        tries: u32,
     ) -> Result<String, SimcomError> {
         let mut retries = tries;
         let mut result = Err(SimcomError::new("no attempts made"));
@@ -419,20 +421,20 @@ impl<'a> SimcomModule<'a> {
     ///   2. Activate context with `AT+CGACT`
     ///   3. Open the network service with `AT+NETOPEN` (replaces Quectel's
     ///      implicit activation via `AT+QIACT`)
-    pub fn initialize_network(&mut self, apn: &str) -> Result<()> {
+    pub fn initialize_network(&mut self, apn: &str, powerup_timeout: Duration, connect_timeout: Duration) -> Result<()> {
         self.detect_and_set_uart_speed(Hertz(460800))?;
 
         info!("Initializing network connection...");
 
         // ── 1. Confirm the modem is talking to us ───────────────────────────
-        self.send_at_command_until("AT", "OK", Duration::from_secs(5), 30)?;
+        self.send_at_command_until("AT", "OK", Duration::from_secs(5), (powerup_timeout.as_secs() / 5) as u32)?;
 
         // Disable echo (may already be off from power_on, but belt-and-braces).
         let _ = self.send_at_command("ATE0", "OK", Duration::from_secs(2));
 
         // ── 2. Wait for SIM card to be ready ────────────────────────────────
         // The SIM can take several seconds to initialise after CFUN=1.
-        self.wait_for_sim_ready(Duration::from_secs(30))?;
+        self.wait_for_sim_ready(Duration::from_secs(10))?;
 
         // ── 3. Wait for network registration ────────────────────────────────
         // Enable unsolicited registration URCs, then poll until the modem
@@ -441,10 +443,10 @@ impl<'a> SimcomModule<'a> {
         self.send_at_command("AT+CGREG=1", "OK", Duration::from_secs(5))?;
         self.send_at_command("AT+CEREG=1", "OK", Duration::from_secs(5))?;
 
-        self.wait_for_network_registration(Duration::from_secs(90))?;
+        self.wait_for_network_registration(connect_timeout)?;
 
         // ── 4. Confirm signal quality is usable (CSQ != 99) ─────────────────
-        self.wait_for_signal(Duration::from_secs(30))?;
+        self.wait_for_signal(Duration::from_secs(5))?;
 
         // ── 5. Configure PDP context ─────────────────────────────────────────
         // Do NOT manually call AT+CGACT here: on the A7670 the bearer is
@@ -475,6 +477,9 @@ impl<'a> SimcomModule<'a> {
 
         // ── 7. Confirm an IP address was assigned ────────────────────────────
         self.send_at_command("AT+CGPADDR=1", "+CGPADDR:", Duration::from_secs(5))?;
+
+        // Tell modem not to automatically response send data
+        self.send_at_command("AT+CIPRXGET=1", "OK", Duration::from_secs(10))?;
 
         self.is_connected = true;
         info!("Network connection established");
@@ -638,7 +643,7 @@ impl<'a> SimcomModule<'a> {
 
         // Wait for the async connection confirmation URC.
         // Format: +CIPOPEN: <socket>,<err>  where err=0 means success.
-        let urc = self.wait_for_response("+CIPOPEN:", Duration::from_secs(150), false)?;
+        let urc = self.wait_for_response("+CIPOPEN:", Duration::from_secs(10), false)?;
 
         // Parse the error code out of "+CIPOPEN: 0,<err>".
         if let Some(urc_pos) = urc.find("+CIPOPEN:") {
@@ -654,10 +659,6 @@ impl<'a> SimcomModule<'a> {
                 }
             }
         }
-
-        // Tell modem not to automatically response send data
-        let recv_cmd = format!("AT+CIPRXGET=1");
-        let _ = self.send_at_command(&recv_cmd, "OK", Duration::from_secs(10));
 
         info!("TCP connection established (socket 0)");
         Ok(0)
@@ -691,6 +692,7 @@ impl<'a> SimcomModule<'a> {
         // Write exactly data.len() bytes — no more, no less.
         self.uart.write(data)?;
 
+        /*
         match self.wait_for_response("+CIPSEND:", Duration::from_secs(60), true) {
             Ok(_) => Ok(()),
             Err(e) => {
@@ -705,6 +707,8 @@ impl<'a> SimcomModule<'a> {
                 Err(e)
             }
         }
+        */
+        Ok(())
     }
 
     /// Receive TCP data from `socket_id`, reading until the modem reports
@@ -719,8 +723,8 @@ impl<'a> SimcomModule<'a> {
 
         let start   = std::time::Instant::now();
         let timeout = Duration::from_secs(120);
-        let chunk   = chunk_size.min(4096);
-        let mut buf = [0u8; 4096];
+        let chunk   = chunk_size.min(1024);
+        let mut buf = vec![0u8; 1024];
 
         loop {
             if start.elapsed() > timeout {
@@ -730,27 +734,31 @@ impl<'a> SimcomModule<'a> {
 
             let recv_cmd = format!("AT+CIPRXGET=2,{},{}", socket_id, chunk);
             info!("Requesting {} bytes, {} received so far", chunk, all_data.len());
-            self.uart.write(format!("{}
-", recv_cmd).as_bytes()).ok();
+            self.uart.write(format!("{}\r\n", recv_cmd).as_bytes()).ok();
 
             // Wait for the reply to *our* command specifically.
             // The response buffer may also contain "+CIPRXGET: 1,..." URCs —
             // searching for "+CIPRXGET: 2," skips them unambiguously.
-            match self.wait_for_response("+CIPRXGET: 2,", Duration::from_secs(10), false) {
+            match self.wait_for_response("+CIPRXGET: 2,", Duration::from_secs(5), true) {
                 Ok(response) => {
                     if let Some(header_start) = response.find("+CIPRXGET: 2,") {
                         let after = &response[header_start..];
-                        if let Some(nl) = after.find("
-") {
+                        if let Some(nl) = after.find("\n") {
                             // Header line: "+CIPRXGET: 2,<socket>,<actual>,<pending>"
                             let fields: Vec<&str> = after[..nl].split(',').collect();
                             if fields.len() >= 4 {
                                 let actual_len  = fields[2].trim().parse::<usize>().unwrap_or(0);
                                 let pending_len = fields[3].trim().parse::<usize>().unwrap_or(0);
+                                let mut empty_polls = 0;
 
                                 if actual_len == 0 {
                                     if pending_len == 0 {
-                                        break; // all data consumed
+                                        empty_polls += 1;
+                                        if empty_polls > 20 {
+                                            break;
+                                        }
+                                        thread::sleep(Duration::from_millis(100));
+                                        continue;
                                     }
                                     thread::sleep(Duration::from_millis(50));
                                     continue;
@@ -785,16 +793,20 @@ impl<'a> SimcomModule<'a> {
                                 }
                             }
                         }
+                    } else {
+                        info!("Unexpected response: {}", response);
                     }
                 }
                 Err(_) => {
                     // Timeout on this chunk — stop rather than spin.
+                    info!("Data retrieval failed: timeout");
                     break;
                 }
             }
         }
 
         info!("receive_tcp_data: {} bytes total", all_data.len());
+        //info!("Data: {:?} / {}", all_data, String::from_utf8_lossy(all_data.as_bytes()));
         all_data
     }
 
@@ -872,8 +884,8 @@ impl<'a> SimcomModule<'a> {
         info!("HTTP request: {} bytes ({} header + {} body)",
             request.len(), request.len() - body_len, body_len);
 
-        // Send in 1460-byte chunks (A7670 AT+CIPSEND per-call limit).
-        const MAX_SEGMENT: usize = 1460;
+        // Send in 1024-byte chunks
+        const MAX_SEGMENT: usize = 1024;
         let total = request.len();
         let mut total_sent = 0;
         for chunk in request.chunks(MAX_SEGMENT) {
@@ -885,30 +897,7 @@ impl<'a> SimcomModule<'a> {
             }
         }
 
-        thread::sleep(Duration::from_millis(500));
-
-        // Wait for the data-ready URC. This also consumes any +IPCLOSE that
-        // arrives alongside it, clearing the UART for the CIPRXGET=2 loop.
-        let early_data = match self.wait_for_response("+CIPRXGET: 1,", Duration::from_secs(10), false) {
-            Ok(urc) => {
-                // Extract any body bytes that arrived in the same UART read as the URC.
-                // Format: "...+CIPRXGET: 1,<socket>\r\n<possible early data>"
-                if let Some(pos) = urc.find("+CIPRXGET: 1,") {
-                    let after_urc = &urc[pos..];
-                    if let Some(nl) = after_urc.find("\r\n") {
-                        let tail = &after_urc[nl + 2..];
-                        tail.as_bytes().to_vec()
-                    } else {
-                        vec![]
-                    }
-                } else {
-                    vec![]
-                }
-            }
-            Err(_) => vec![],
-        };
-
-        let response = self.receive_tcp_data(socket_id, 4096, &early_data);
+        let response = self.receive_tcp_data(socket_id, 1024, b"");
 
         let _ = self.close_tcp_connection(socket_id);
 
@@ -926,7 +915,7 @@ impl<'a> SimcomModule<'a> {
         if response.status >= 200 && response.status < 400 {
             info!("HTTP POST successful");
         } else {
-            bail!("HTTP POST failed with response: {:?}", response.body)
+            bail!("HTTP POST failed with response: {:?} (status: {}, headers: {:?})", response.body, response.status, response.headers)
         }
         Ok(response)
     }
@@ -943,14 +932,32 @@ impl<'a> SimcomModule<'a> {
     pub fn is_connected(&self) -> bool {
         self.is_connected
     }
+    ///
+    /// Read network time from `AT+CCLK`.
+    pub fn network_time(&mut self) -> Result<NaiveDateTime> {
+        let resp = self.send_at_command("AT+CCLK?", "OK", Duration::from_millis(300))
+            .map_err(|e| anyhow!("AT+CCLK failed: {}", e))?;
+
+        if let Some(pos) = resp.find("+CCLK:") {
+            let datetime_response_str = resp[pos + 8..].trim_start();
+            let datetime_str = &datetime_response_str[.. 16];
+            if let Ok(date) = NaiveDateTime::parse_from_str(datetime_str, "%y/%m/%d,%H:%M:%S") {
+                return Ok(date);
+            } else {
+                return Err(anyhow!("Could not parse date: {} ({})", resp, datetime_str));
+            }
+        }
+
+        Err(anyhow!("Could not retrieve date: {}", resp))
+    }
 }
 
 
 use crate::modem::{Modem, HttpResponse, parse_http_response_bytes};
 
 impl<'a> Modem for SimcomModule<'a> {
-    fn initialize_network(&mut self, apn: &str) -> Result<()> {
-        self.initialize_network(apn)
+    fn initialize_network(&mut self, apn: &str, powerup_timeout: Duration, connect_timeout: Duration) -> Result<()> {
+        self.initialize_network(apn, powerup_timeout, connect_timeout)
     }
     fn http_post(&mut self, url: &str, body: &[u8], headers: &[(&str, &str)]) -> Result<HttpResponse> {
         self.http_post(url, body, headers)
@@ -963,5 +970,8 @@ impl<'a> Modem for SimcomModule<'a> {
     }
     fn battery_voltage(&mut self) -> Result<f32> {
         self.battery_voltage()
+    }
+    fn network_time(&mut self) -> Result<NaiveDateTime> {
+        self.network_time()
     }
 }
