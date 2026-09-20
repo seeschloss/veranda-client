@@ -79,7 +79,7 @@ pub fn init(jpeg_quality: i32) -> Option<Camera<'static>> {
         XCLK_FREQ_HZ,
         jpeg_quality,
         FB_COUNT,
-        camera::camera_grab_mode_t_CAMERA_GRAB_LATEST,
+        camera::camera_grab_mode_t_CAMERA_GRAB_WHEN_EMPTY,
         camera::framesize_t_FRAMESIZE_QSXGA,
     ) {
         Ok(cam) => {

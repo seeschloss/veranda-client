@@ -7,7 +7,7 @@ use esp_idf_svc::{
 };
 use esp_idf_hal::io::Write;
 use log::info;
-use std::io::Read;
+use std::time::Duration;
 
 use crate::modem::{HttpResponse, Modem};
 
@@ -163,6 +163,12 @@ impl Modem for WifiModem {
         Err(anyhow!("Not available on WiFi"))
     }
     fn network_time(&mut self) -> Result<NaiveDateTime> {
+        Err(anyhow!("Not available on WiFi"))
+    }
+    fn reboot(&mut self) -> Result<()> {
+        Err(anyhow!("Not available on WiFi"))
+    }
+    fn power_off(&mut self) -> Result<()> {
         Err(anyhow!("Not available on WiFi"))
     }
 }

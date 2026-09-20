@@ -1,6 +1,6 @@
 [package]
 name = "athena"
-version = "2.99.0"
+version = "3.7.0"
 edition = "2021"
 resolver = "2"
 
@@ -25,6 +25,7 @@ embuild = "*"
 
 [profile.release]
 opt-level = "s"
+strip = false
 
 [profile.dev]
 debug = true
@@ -35,18 +36,12 @@ name = "athena"
 harness = false
 
 [package.metadata.esp-idf-sys]
-# This will automatically generate UF2 after build
 esp_idf_version = "v5.5"
 
-
-#[env]
-#lib_deps = "esp32-camera"
-
-#[[package.metadata.esp-idf-sys.extra_components]]
-#remote_component = { name = "espressif/esp32-camera", version = "2.1.0" }
-#bindings_header = "bindings.h"
-#bindings_module = "camera"
-
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/esp32-camera", version = "2.1.6" }
+bindings_header = "esp-camera-rs/bindings.h"
+bindings_module = "camera"
 
 [package.metadata.espflash]
 partition_table = "partitions.csv"
@@ -56,6 +51,7 @@ default = []
 
 board-xiao = []
 board-wroom = []
+board-esp32cam = []
 
 modem-simcom = []
 modem-quectel = []

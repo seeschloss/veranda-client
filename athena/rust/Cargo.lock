@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "athena"
-version = "2.99.0"
+version = "3.7.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -58,7 +58,7 @@ dependencies = [
  "esp-idf-hal",
  "esp-idf-svc",
  "esp-idf-sys",
- "heapless 0.9.2",
+ "heapless 0.8.0",
  "ina3221",
  "log",
  "sha2",

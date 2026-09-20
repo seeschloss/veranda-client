@@ -3,6 +3,7 @@ use log::info;
 use sha2::{Digest, Sha256};
 use esp_idf_sys::{
     esp, esp_ota_begin, esp_ota_end, esp_ota_get_next_update_partition,
+    esp_ota_mark_app_valid_cancel_rollback,
     esp_ota_handle_t, esp_ota_set_boot_partition, esp_ota_write,
     esp_restart, OTA_SIZE_UNKNOWN,
 };
@@ -43,5 +44,11 @@ fn verify_sha256(data: &[u8], expected: &str) -> bool {
 
 pub fn check_firmware_compatibility(firmware: &[u8], tag: &[u8]) -> bool {
     firmware.windows(tag.len()).any(|w| w == tag)
+}
+
+pub fn mark_update_as_valid() {
+    unsafe {
+        let _ = esp!(esp_ota_mark_app_valid_cancel_rollback());
+    }
 }
 

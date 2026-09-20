@@ -5,6 +5,6 @@ partition_table = "partitions.csv"
 
 [flash]
 mode = "dio"
-size = "8MB"
+size = "4MB"
 frequency = "80MHz"
 baud = 921600

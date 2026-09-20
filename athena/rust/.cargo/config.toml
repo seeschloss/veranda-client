@@ -6,8 +6,14 @@ linker = "ldproxy"
 # runner = "espflash --monitor" # Select this runner for espflash v1.x.x
 runner = "espflash flash --monitor" # Select this runner for espflash v2.x.x
 
+[target.xtensa-esp32-espidf]
+linker = "ldproxy"
+# runner = "espflash --monitor" # Select this runner for espflash v1.x.x
+runner = "espflash flash --monitor" # Select this runner for espflash v2.x.x
+
 [unstable]
 build-std = ["std", "panic_abort"]
 
 [env]
 MCU="esp32s3"
+ESP_IDF_VERSION = "v5.5.1"
